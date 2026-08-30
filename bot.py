@@ -1,5 +1,6 @@
 import os
 import math
+import re
 from datetime import datetime, timedelta
 
 import discord
@@ -20,7 +21,6 @@ if not TOKEN:
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL not found. Please add MONGO_URL to your environment variables.")
 
-# Асинхронное подключение к MongoDB через Motor
 cluster = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db = cluster["dorysta_bot"]
 tickets_col = db["tickets"]
@@ -158,12 +158,13 @@ def check_admin_slash():
     return app_commands.check(predicate)
 
 
-def is_valid_addticket(transcript_url: str, category: str) -> bool:
-    if "https://discord.com/" not in transcript_url:
-        return False
+def validate_addticket_args(transcript_url: str, category: str) -> tuple[bool, str]:
+    if not (transcript_url.startswith("https://discord.com/") or transcript_url.startswith("<#") or transcript_url.isdigit()):
+        return False, f"Ссылка или канал `{transcript_url}` некорректны. Ссылка должна начинаться с `https://discord.com/`"
     if category not in VALID_CATEGORIES:
-        return False
-    return True
+        cats_formatted = ", ".join([f"`{c}`" for c in VALID_CATEGORIES])
+        return False, f"Категория `{category}` не найдена.\nДопустимые категории: {cats_formatted}"
+    return True, ""
 
 
 async def is_transcript_exists(transcript_url: str) -> bool:
@@ -183,7 +184,7 @@ async def get_user_fast(user_id: int) -> discord.User | None:
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"Bot logged in as {bot.user} with Motor (Async MongoDB) connected!")
+    print(f"Bot logged in as {bot.user} with Motor connected!")
 
     channel = bot.get_channel(UPDATE_ID_CHANNEL)
     if channel:
@@ -543,38 +544,6 @@ def get_addticket_usage_embed():
     return embed
 
 
-def get_ticketstats_usage_embed():
-    embed = discord.Embed(color=EMBED_COLOR)
-    embed.title = "Команда: ticketstats"
-    embed.description = "Посмотреть статистику тикетов и транскриптов модератора"
-    embed.add_field(name="Использование:", value="`.ticketstats [упоминание / ID модератора]`", inline=False)
-    embed.add_field(
-        name="Примеры:",
-        value="`.ts` — показать свою статистику\n`.ticketstats [ID модератора]` — показать статистику выбранного модератора",
-        inline=False,
-    )
-    embed.set_footer(text=FOOTER_TEXT)
-    return embed
-
-
-def get_ticketlogs_usage_embed():
-    embed = discord.Embed(color=EMBED_COLOR)
-    embed.title = "Команда: ticketlogs"
-    embed.description = "Посмотреть список обработанных тикетов модератора с постраничной навигацией"
-    embed.add_field(name="Использование:", value="`.ticketlogs [упоминание / ID модератора] [номер страницы]`", inline=False)
-    embed.add_field(
-        name="Примеры:",
-        value=(
-            "`.tl` — показать 1-ю страницу своих логов\n"
-            "`.tl 2` — показать 2-ю страницу своих логов\n"
-            "`.ticketlogs 851443344718430210 1` — показать 1-ю страницу логов модератора"
-        ),
-        inline=False,
-    )
-    embed.set_footer(text=FOOTER_TEXT)
-    return embed
-
-
 def get_deleteticket_usage_embed():
     embed = discord.Embed(color=EMBED_COLOR)
     embed.title = "Команда: deleteticket 🔒"
@@ -612,12 +581,13 @@ async def slash_help(interaction: discord.Interaction):
 @check_transcript_slash()
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
 async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcript: str, category: str):
-    if not is_valid_addticket(transcript, category):
-        await interaction.response.send_message(embed=get_addticket_usage_embed(), ephemeral=True)
+    valid, err_msg = validate_addticket_args(transcript, category)
+    if not valid:
+        await interaction.response.send_message(f"<:bruh:1521904409582375174> {err_msg}", ephemeral=True)
         return
 
     try:
-        staff_id = int(staff.strip("<@!>"))
+        staff_id = int(re.sub(r"\D", "", staff))
     except ValueError:
         await interaction.response.send_message(f"<:bruh:1521904409582375174> Некорректный ID: `{staff}`.", ephemeral=True)
         return
@@ -655,7 +625,6 @@ async def slash_add_ticket_error(interaction: discord.Interaction, error: app_co
             ephemeral=True,
         )
         return
-    print(f"addticket (slash) error: {error!r}")
 
 
 @bot.tree.command(name="ticketstats", description="Посмотреть статистику тикетов")
@@ -721,21 +690,31 @@ async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
         await ctx.send(embed=get_addticket_usage_embed())
         return
 
-    parts = args.split(maxsplit=2)
-    if len(parts) < 3:
-        await ctx.send(embed=get_addticket_usage_embed())
+    # Извлечение ID, ссылки/канала и категории с помощью Regex
+    match = re.match(r"^<@!?(\d+)>|^\b(\d+)\b", args.strip())
+    if not match:
+        await ctx.send("<:bruh:1521904409582375174> Не удалось извлечь ID или упоминание модератора в начале команды.")
         return
 
-    staff_raw, transcript, category = parts[0], parts[1], parts[2]
+    staff_id = int(match.group(1) or match.group(2))
+    remaining_text = args[match.end():].strip()
 
-    if not is_valid_addticket(transcript, category):
-        await ctx.send(embed=get_addticket_usage_embed())
+    # Извлекаем следующий элемент (ссылка или упоминание канала <#...>)
+    second_part = remaining_text.split(maxsplit=1)
+    if not second_part:
+        await ctx.send("<:bruh:1521904409582375174> Отсутствует ссылка на транскрипт и категория.")
         return
 
-    try:
-        staff_id = int(staff_raw.strip("<@!>"))
-    except ValueError:
-        await ctx.send("<:bruh:1521904409582375174> Укажите корректный numeric ID модератора.")
+    transcript = second_part[0]
+    category = second_part[1] if len(second_part) > 1 else ""
+
+    if not category:
+        await ctx.send("<:bruh:1521904409582375174> Вы не указали категорию тикета.")
+        return
+
+    valid, err_msg = validate_addticket_args(transcript, category)
+    if not valid:
+        await ctx.send(f"<:bruh:1521904409582375174> {err_msg}")
         return
 
     if staff_id == ctx.author.id:
@@ -748,7 +727,7 @@ async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
 
     staff_user = await get_user_fast(staff_id)
     if not staff_user:
-        await ctx.send(f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff_raw}`.")
+        await ctx.send(f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff_id}`.")
         return
 
     embed = await process_add_ticket(ctx.author, staff_user, transcript, category)
@@ -769,22 +748,44 @@ async def prefix_add_ticket_error(ctx: commands.Context, error):
     if isinstance(error, commands.CheckFailure):
         await ctx.send(f"<:bruh:1521904409582375174> {error}")
         return
-    print(f"addticket prefix error: {error!r}")
-    await ctx.send(embed=get_addticket_usage_embed())
 
 
 @bot.command(name="ticketstats", aliases=["ts"])
 @check_support_prefix()
-async def prefix_ticket_stats(ctx: commands.Context, staff: discord.User = None):
-    target_user = staff or ctx.author
+async def prefix_ticket_stats(ctx: commands.Context, *, target: str = None):
+    target_user = ctx.author
+    if target:
+        user_id = int(re.sub(r"\D", "", target)) if re.search(r"\d+", target) else None
+        if user_id:
+            fetched = await get_user_fast(user_id)
+            if fetched:
+                target_user = fetched
+            else:
+                await ctx.send(f"<:bruh:1521904409582375174> Пользователь с ID `{user_id}` не найден.")
+                return
+
     embed = await process_ticket_stats(target_user)
     await ctx.send(embed=embed)
 
 
 @bot.command(name="ticketlogs", aliases=["tl"])
 @check_transcript_prefix()
-async def prefix_ticket_logs(ctx: commands.Context, staff: discord.User = None, page: int = 1):
-    target_user = staff or ctx.author
+async def prefix_ticket_logs(ctx: commands.Context, *, args: str = None):
+    target_user = ctx.author
+    page = 1
+
+    if args:
+        parts = args.split()
+        for part in parts:
+            if part.isdigit():
+                page = int(part)
+            else:
+                user_id = int(re.sub(r"\D", "", part)) if re.search(r"\d+", part) else None
+                if user_id:
+                    fetched = await get_user_fast(user_id)
+                    if fetched:
+                        target_user = fetched
+
     embed = await process_ticket_logs(target_user, page)
     await ctx.send(embed=embed)
 
@@ -798,12 +799,12 @@ async def prefix_leaderboard(ctx: commands.Context):
 
 @bot.command(name="deleteticket", aliases=["dt"])
 @check_admin_prefix()
-async def prefix_delete_ticket(ctx: commands.Context, log_id: int = None):
-    if log_id is None:
+async def prefix_delete_ticket(ctx: commands.Context, log_id: str = None):
+    if not log_id or not log_id.isdigit():
         await ctx.send(embed=get_deleteticket_usage_embed())
         return
 
-    ticket = await delete_ticket(log_id)
+    ticket = await delete_ticket(int(log_id))
     if not ticket:
         await ctx.send(f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден.")
         return
@@ -811,31 +812,25 @@ async def prefix_delete_ticket(ctx: commands.Context, log_id: int = None):
     await ctx.send(f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
 
 
-@prefix_delete_ticket.error
-async def prefix_delete_ticket_error(ctx: commands.Context, error):
-    if isinstance(error, commands.BadArgument):
-        await ctx.send(embed=get_deleteticket_usage_embed())
-        return
-
-
 @bot.command(name="resettickets", aliases=["rt"])
 @check_admin_prefix()
-async def prefix_reset_tickets(ctx: commands.Context, staff: discord.User = None):
-    if staff is None:
+async def prefix_reset_tickets(ctx: commands.Context, *, target: str = None):
+    if not target:
         await ctx.send(embed=get_resettickets_usage_embed())
         return
 
-    count = await reset_tickets(staff.id)
+    user_id = int(re.sub(r"\D", "", target)) if re.search(r"\d+", target) else None
+    if not user_id:
+        await ctx.send("<:bruh:1521904409582375174> Укажите корректного пользователя.")
+        return
+
+    staff_user = await get_user_fast(user_id)
+    name = staff_user.name if staff_user else str(user_id)
+
+    count = await reset_tickets(user_id)
     await ctx.send(
-        f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`."
+        f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{name}**: `{count}`."
     )
-
-
-@prefix_reset_tickets.error
-async def prefix_reset_tickets_error(ctx: commands.Context, error):
-    if isinstance(error, commands.BadArgument):
-        await ctx.send(embed=get_resettickets_usage_embed())
-        return
 
 
 if __name__ == "__main__":
