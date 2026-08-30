@@ -6,7 +6,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-import pymongo
+import motor.motor_asyncio
+from pymongo import ReturnDocument, ASCENDING, DESCENDING
 
 load_dotenv()
 
@@ -19,19 +20,19 @@ if not TOKEN:
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL not found. Please add MONGO_URL to your environment variables.")
 
-
-cluster = pymongo.MongoClient(MONGO_URL)
+# Асинхронное подключение к MongoDB через Motor
+cluster = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db = cluster["dorysta_bot"]
 tickets_col = db["tickets"]
 counters_col = db["counters"]
 
 
-def get_next_ticket_id() -> int:
-    counter = counters_col.find_one_and_update(
+async def get_next_ticket_id() -> int:
+    counter = await counters_col.find_one_and_update(
         {"_id": "ticket_id"},
         {"$inc": {"seq": 1}},
         upsert=True,
-        return_document=pymongo.ReturnDocument.AFTER,
+        return_document=ReturnDocument.AFTER,
     )
     return counter["seq"]
 
@@ -165,14 +166,24 @@ def is_valid_addticket(transcript_url: str, category: str) -> bool:
     return True
 
 
-def is_transcript_exists(transcript_url: str) -> bool:
-    return tickets_col.find_one({"transcript_url": transcript_url}) is not None
+async def is_transcript_exists(transcript_url: str) -> bool:
+    return (await tickets_col.find_one({"transcript_url": transcript_url})) is not None
+
+
+async def get_user_fast(user_id: int) -> discord.User | None:
+    user = bot.get_user(user_id)
+    if user:
+        return user
+    try:
+        return await bot.fetch_user(user_id)
+    except (discord.NotFound, discord.HTTPException):
+        return None
 
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"Bot logged in as {bot.user} with MongoDB connected!")
+    print(f"Bot logged in as {bot.user} with Motor (Async MongoDB) connected!")
 
     channel = bot.get_channel(UPDATE_ID_CHANNEL)
     if channel:
@@ -207,19 +218,19 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-def get_monthly_tickets(staff_id: int) -> int:
+async def get_monthly_tickets(staff_id: int) -> int:
     date_30_days = datetime.utcnow() - timedelta(days=30)
-    return tickets_col.count_documents({
+    return await tickets_col.count_documents({
         "staff_id": staff_id,
         "created_at": {"$gte": date_30_days}
     })
 
 
-def process_add_ticket(author_user: discord.User, staff_user: discord.User, transcript_url: str, category: str):
-    ticket_id = get_next_ticket_id()
+async def process_add_ticket(author_user: discord.User, staff_user: discord.User, transcript_url: str, category: str):
+    ticket_id = await get_next_ticket_id()
     now = datetime.utcnow()
 
-    tickets_col.insert_one({
+    await tickets_col.insert_one({
         "ticket_id": ticket_id,
         "staff_id": staff_user.id,
         "author_id": author_user.id,
@@ -228,7 +239,7 @@ def process_add_ticket(author_user: discord.User, staff_user: discord.User, tran
         "created_at": now
     })
 
-    monthly_count = get_monthly_tickets(staff_user.id)
+    monthly_count = await get_monthly_tickets(staff_user.id)
     timestamp = int(now.timestamp())
     discord_timestamp = f"<t:{timestamp}:F>"
 
@@ -246,8 +257,9 @@ def process_add_ticket(author_user: discord.User, staff_user: discord.User, tran
     return embed
 
 
-def process_ticket_logs(target_user: discord.User, page: int = 1):
-    logs = list(tickets_col.find({"staff_id": target_user.id}).sort("ticket_id", pymongo.ASCENDING))
+async def process_ticket_logs(target_user: discord.User, page: int = 1):
+    cursor = tickets_col.find({"staff_id": target_user.id}).sort("ticket_id", ASCENDING)
+    logs = await cursor.to_list(length=None)
 
     if not logs:
         embed = discord.Embed(
@@ -299,26 +311,26 @@ def process_ticket_logs(target_user: discord.User, page: int = 1):
     return embed
 
 
-def process_ticket_stats(target_user: discord.User):
+async def process_ticket_stats(target_user: discord.User):
     now = datetime.utcnow()
     date_7_days = now - timedelta(days=7)
     date_30_days = now - timedelta(days=30)
 
-    count_7_staff = tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": date_7_days}})
-    count_30_staff = tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": date_30_days}})
-    count_all_staff = tickets_col.count_documents({"staff_id": target_user.id})
+    count_7_staff = await tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": date_7_days}})
+    count_30_staff = await tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": date_30_days}})
+    count_all_staff = await tickets_col.count_documents({"staff_id": target_user.id})
 
-    count_7_author = tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": date_7_days}})
-    count_30_author = tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": date_30_days}})
-    count_all_author = tickets_col.count_documents({"author_id": target_user.id})
+    count_7_author = await tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": date_7_days}})
+    count_30_author = await tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": date_30_days}})
+    count_all_author = await tickets_col.count_documents({"author_id": target_user.id})
 
-    last_staff_doc = tickets_col.find_one({"staff_id": target_user.id}, sort=[("ticket_id", pymongo.DESCENDING)])
+    last_staff_doc = await tickets_col.find_one({"staff_id": target_user.id}, sort=[("ticket_id", DESCENDING)])
     if last_staff_doc and isinstance(last_staff_doc.get("created_at"), datetime):
         last_staff_str = f"<t:{int(last_staff_doc['created_at'].timestamp())}:R>"
     else:
         last_staff_str = "—"
 
-    last_author_doc = tickets_col.find_one({"author_id": target_user.id}, sort=[("ticket_id", pymongo.DESCENDING)])
+    last_author_doc = await tickets_col.find_one({"author_id": target_user.id}, sort=[("ticket_id", DESCENDING)])
     if last_author_doc and isinstance(last_author_doc.get("created_at"), datetime):
         last_author_str = f"<t:{int(last_author_doc['created_at'].timestamp())}:R>"
     else:
@@ -356,12 +368,12 @@ def process_ticket_stats(target_user: discord.User):
     return embed
 
 
-def process_leaderboard():
+async def process_leaderboard():
     now = datetime.utcnow()
     date_7_days = now - timedelta(days=7)
     date_30_days = now - timedelta(days=30)
 
-    def get_top_users(field: str, min_date: datetime = None):
+    async def get_top_users(field: str, min_date: datetime = None):
         match_stage = {"$match": {field: {"$ne": 0}}}
         if min_date:
             match_stage["$match"]["created_at"] = {"$gte": min_date}
@@ -372,15 +384,16 @@ def process_leaderboard():
             {"$sort": {"cnt": -1}},
             {"$limit": 5}
         ]
-        return list(tickets_col.aggregate(pipeline))
+        cursor = tickets_col.aggregate(pipeline)
+        return await cursor.to_list(length=5)
 
-    top_7_staff = get_top_users("staff_id", date_7_days)
-    top_30_staff = get_top_users("staff_id", date_30_days)
-    top_all_staff = get_top_users("staff_id")
+    top_7_staff = await get_top_users("staff_id", date_7_days)
+    top_30_staff = await get_top_users("staff_id", date_30_days)
+    top_all_staff = await get_top_users("staff_id")
 
-    top_7_author = get_top_users("author_id", date_7_days)
-    top_30_author = get_top_users("author_id", date_30_days)
-    top_all_author = get_top_users("author_id")
+    top_7_author = await get_top_users("author_id", date_7_days)
+    top_30_author = await get_top_users("author_id", date_30_days)
+    top_all_author = await get_top_users("author_id")
 
     def format_top(top_list, unit_label="тикетов"):
         if not top_list:
@@ -435,13 +448,12 @@ def process_leaderboard():
     return embed
 
 
-def delete_ticket(log_id: int):
-    result = tickets_col.find_one_and_delete({"ticket_id": log_id})
-    return result
+async def delete_ticket(log_id: int):
+    return await tickets_col.find_one_and_delete({"ticket_id": log_id})
 
 
-def reset_tickets(staff_id: int) -> int:
-    result = tickets_col.delete_many({
+async def reset_tickets(staff_id: int) -> int:
+    result = await tickets_col.delete_many({
         "$or": [{"staff_id": staff_id}, {"author_id": staff_id}]
     })
     return result.deleted_count
@@ -616,21 +628,20 @@ async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcr
         )
         return
 
-    if is_transcript_exists(transcript):
+    if await is_transcript_exists(transcript):
         await interaction.response.send_message(
             "<:bruh:1521904409582375174> этот транскрипт уже внесен", ephemeral=True
         )
         return
 
-    try:
-        staff_user = await bot.fetch_user(staff_id)
-    except (discord.NotFound, discord.HTTPException):
+    staff_user = await get_user_fast(staff_id)
+    if not staff_user:
         await interaction.response.send_message(
             f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff}`.", ephemeral=True
         )
         return
 
-    embed = process_add_ticket(interaction.user, staff_user, transcript, category)
+    embed = await process_add_ticket(interaction.user, staff_user, transcript, category)
     await interaction.response.send_message(embed=embed)
 
 
@@ -652,7 +663,7 @@ async def slash_add_ticket_error(interaction: discord.Interaction, error: app_co
 @check_support_slash()
 async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.User = None):
     target_user = staff or interaction.user
-    embed = process_ticket_stats(target_user)
+    embed = await process_ticket_stats(target_user)
     await interaction.response.send_message(embed=embed)
 
 
@@ -661,14 +672,14 @@ async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.Us
 @check_transcript_slash()
 async def slash_ticket_logs(interaction: discord.Interaction, staff: discord.User = None, page: int = 1):
     target_user = staff or interaction.user
-    embed = process_ticket_logs(target_user, page)
+    embed = await process_ticket_logs(target_user, page)
     await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="leaderboard", description="Посмотреть топ модераторов по тикетам и транскриптам")
 @check_support_slash()
 async def slash_leaderboard(interaction: discord.Interaction):
-    embed = process_leaderboard()
+    embed = await process_leaderboard()
     await interaction.response.send_message(embed=embed)
 
 
@@ -676,7 +687,7 @@ async def slash_leaderboard(interaction: discord.Interaction):
 @app_commands.describe(log_id="Номер лога, который нужно удалить")
 @check_admin_slash()
 async def slash_delete_ticket(interaction: discord.Interaction, log_id: int):
-    ticket = delete_ticket(log_id)
+    ticket = await delete_ticket(log_id)
     if not ticket:
         await interaction.response.send_message(
             f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден.", ephemeral=True
@@ -689,7 +700,7 @@ async def slash_delete_ticket(interaction: discord.Interaction, log_id: int):
 @app_commands.describe(staff="Модератор, чьи логи удалить (Укажите пользователя)")
 @check_admin_slash()
 async def slash_reset_tickets(interaction: discord.Interaction, staff: discord.User):
-    count = reset_tickets(staff.id)
+    count = await reset_tickets(staff.id)
     await interaction.response.send_message(
         f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`."
     )
@@ -731,18 +742,16 @@ async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
         await ctx.send("<:bruh:1521904409582375174> Вы не можете занести тикет, который провели сами!")
         return
 
-    if is_transcript_exists(transcript):
+    if await is_transcript_exists(transcript):
         await ctx.send("<:bruh:1521904409582375174> этот транскрипт уже внесен")
         return
 
-    try:
-        staff_user = await bot.fetch_user(staff_id)
-    except (discord.NotFound, discord.HTTPException) as e:
-        print(f"addticket lookup error: {e!r}")
+    staff_user = await get_user_fast(staff_id)
+    if not staff_user:
         await ctx.send(f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff_raw}`.")
         return
 
-    embed = process_add_ticket(ctx.author, staff_user, transcript, category)
+    embed = await process_add_ticket(ctx.author, staff_user, transcript, category)
     await ctx.send(embed=embed)
 
 
@@ -768,7 +777,7 @@ async def prefix_add_ticket_error(ctx: commands.Context, error):
 @check_support_prefix()
 async def prefix_ticket_stats(ctx: commands.Context, staff: discord.User = None):
     target_user = staff or ctx.author
-    embed = process_ticket_stats(target_user)
+    embed = await process_ticket_stats(target_user)
     await ctx.send(embed=embed)
 
 
@@ -776,14 +785,14 @@ async def prefix_ticket_stats(ctx: commands.Context, staff: discord.User = None)
 @check_transcript_prefix()
 async def prefix_ticket_logs(ctx: commands.Context, staff: discord.User = None, page: int = 1):
     target_user = staff or ctx.author
-    embed = process_ticket_logs(target_user, page)
+    embed = await process_ticket_logs(target_user, page)
     await ctx.send(embed=embed)
 
 
 @bot.command(name="leaderboard", aliases=["lb"])
 @check_support_prefix()
 async def prefix_leaderboard(ctx: commands.Context):
-    embed = process_leaderboard()
+    embed = await process_leaderboard()
     await ctx.send(embed=embed)
 
 
@@ -794,7 +803,7 @@ async def prefix_delete_ticket(ctx: commands.Context, log_id: int = None):
         await ctx.send(embed=get_deleteticket_usage_embed())
         return
 
-    ticket = delete_ticket(log_id)
+    ticket = await delete_ticket(log_id)
     if not ticket:
         await ctx.send(f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден.")
         return
@@ -816,7 +825,7 @@ async def prefix_reset_tickets(ctx: commands.Context, staff: discord.User = None
         await ctx.send(embed=get_resettickets_usage_embed())
         return
 
-    count = reset_tickets(staff.id)
+    count = await reset_tickets(staff.id)
     await ctx.send(
         f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`."
     )
