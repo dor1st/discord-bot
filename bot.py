@@ -229,8 +229,13 @@ async def send_restart_embed():
 
     channel = bot.get_channel(UPDATE_ID_CHANNEL)
     if channel is None:
-        print(f"send_restart_embed: канал {UPDATE_ID_CHANNEL} не найден (бот не в гильдии или неверный ID).")
-        return
+        # Кеш гильдий/каналов мог ещё не прогреться на самом первом on_ready
+        # после деплоя — пробуем достать канал напрямую через API.
+        try:
+            channel = await bot.fetch_channel(UPDATE_ID_CHANNEL)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f"send_restart_embed: канал {UPDATE_ID_CHANNEL} не найден ни в кеше, ни через fetch: {e!r}")
+            return
 
     timestamp = int(datetime.utcnow().timestamp())
     embed = discord.Embed(
@@ -252,10 +257,22 @@ async def send_restart_embed():
 
 @bot.event
 async def on_ready():
-    await ensure_indexes()
-    await bot.tree.sync()
+    try:
+        await ensure_indexes()
+    except Exception as e:
+        print(f"on_ready: ensure_indexes() упал с ошибкой: {e!r}")
+
+    try:
+        await bot.tree.sync()
+    except Exception as e:
+        print(f"on_ready: bot.tree.sync() упал с ошибкой: {e!r}")
+
     print(f"Bot logged in as {bot.user} with Motor connected!")
-    await send_restart_embed()
+
+    try:
+        await send_restart_embed()
+    except Exception as e:
+        print(f"on_ready: send_restart_embed() упал с ошибкой: {e!r}")
 
 
 @bot.event
