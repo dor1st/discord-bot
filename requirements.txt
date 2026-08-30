@@ -1,5 +1,2 @@
 discord.py
 python-dotenv
-pymongo
-motor
-dnspython
