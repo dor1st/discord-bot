@@ -52,6 +52,9 @@ bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
 EMBED_COLOR = discord.Color(0x212121)
 FOOTER_TEXT = "ТУСОВКА ДОРИСТА"
 
+# Количество логов на одной странице пагинации
+LOGS_PER_PAGE = 3
+
 # ================= НАСТРОЙКА РОЛЕЙ И КАНАЛОВ =================
 
 ALLOWED_CHANNEL_IDS = [1322968592202993746, 1537220150267220018]
@@ -196,13 +199,12 @@ def process_ticket_logs(target_user: discord.User, page: int = 1) -> tuple[disco
         embed.set_footer(text=f"Страница 1/1 (0 логов) • {FOOTER_TEXT}")
         return embed, 1
 
-    items_per_page = 5
     total_logs = len(logs)
-    total_pages = math.ceil(total_logs / items_per_page)
+    total_pages = math.ceil(total_logs / LOGS_PER_PAGE)
     current_page = max(1, min(page, total_pages))
 
-    start_idx = (current_page - 1) * items_per_page
-    current_logs = logs[start_idx:start_idx + items_per_page]
+    start_idx = (current_page - 1) * LOGS_PER_PAGE
+    current_logs = logs[start_idx:start_idx + LOGS_PER_PAGE]
 
     embed = discord.Embed(title=f"<:ticket:1522343287816716379> Тикеты — {target_user.name}", color=EMBED_COLOR)
     embed.description = f"{target_user.id}\n" + "—" * 28
