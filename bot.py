@@ -22,10 +22,6 @@ if not TOKEN:
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL not found. Please add MONGO_URL to your environment variables.")
 
-# ВАЖНО: используем motor (async-клиент), а не pymongo.MongoClient.
-# Синхронный pymongo внутри discord.py блокирует весь event loop бота на
-# время каждого запроса к базе — именно это и было главной причиной
-# зависаний/задержек и "бот не отвечает".
 cluster = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db = cluster["dorysta_bot"]
 tickets_col = db["tickets"]
@@ -78,7 +74,7 @@ ADMIN_ROLE_IDS = [1322962317885046844, 1502684875868737796]
 VALID_CATEGORIES = [
     "Помощь по серверу",
     "Получение призов",
-    "Получение ролей",
+    "Получение роли",
     "Покупка рекламы"
 ]
 
