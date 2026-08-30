@@ -8,7 +8,6 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import pymongo
 
-# Завантажуємо змінні середовища з .env (для ПК) або з хостингу (Railway)
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -20,7 +19,6 @@ if not TOKEN:
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL not found. Please add MONGO_URL to your environment variables.")
 
-# ================= НАЛАШТУВАННЯ БАЗИ ДАНИХ (MongoDB) =================
 
 cluster = pymongo.MongoClient(MONGO_URL)
 db = cluster["dorysta_bot"]
@@ -39,7 +37,6 @@ def get_next_ticket_id() -> int:
     return counter["seq"]
 
 
-# ================= НАЛАШТУВАННЯ БОТА =================
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -67,7 +64,6 @@ VALID_CATEGORIES = [
 ]
 
 
-# ================= ПЕРЕВІРКИ ТА ДОСТУП =================
 
 def has_role_access(user: discord.Member | discord.User, role_ids: list[int]) -> bool:
     if not isinstance(user, discord.Member):
@@ -113,7 +109,6 @@ def check_access(
     return True, ""
 
 
-# Чеки префіксних команд
 def check_support_prefix():
     async def predicate(ctx: commands.Context):
         ok, msg = check_access(ctx.author, ctx.channel.id, SUPPORT_ROLE_IDS, SUPPORT_CHANNEL_IDS)
@@ -187,7 +182,6 @@ async def on_ready():
     print(f"Bot logged in as {bot.user} with MongoDB connected!")
 
 
-# ================= ОБРОБКА ПОМИЛОК =================
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
@@ -210,7 +204,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-# ================= ЛОГІКА ТИКЕТІВ (MongoDB) =================
 
 def get_monthly_tickets(staff_id: int) -> int:
     date_30_days = datetime.utcnow() - timedelta(days=30)
@@ -589,9 +582,6 @@ def get_resettickets_usage_embed():
     embed.set_footer(text=FOOTER_TEXT)
     return embed
 
-
-# ================= СЛЭШ-КОМАНДЫ =================
-
 @bot.tree.command(name="help", description="Показать полный список команд бота")
 @check_support_slash()
 async def slash_help(interaction: discord.Interaction):
@@ -702,9 +692,6 @@ async def slash_reset_tickets(interaction: discord.Interaction, staff: discord.U
     await interaction.response.send_message(
         f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`."
     )
-
-
-# ================= ПРЕФІКСНІ КОМАНДИ =================
 
 @bot.command(name="help")
 @check_support_prefix()
@@ -840,6 +827,5 @@ async def prefix_reset_tickets_error(ctx: commands.Context, error):
         return
 
 
-# Запуск бота
 if __name__ == "__main__":
     bot.run(TOKEN)
