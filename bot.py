@@ -1,6 +1,7 @@
 import os
 import math
 import re
+import asyncio
 from datetime import datetime, timedelta
 
 import discord
@@ -9,6 +10,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import motor.motor_asyncio
 from pymongo import ReturnDocument, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -25,6 +27,27 @@ cluster = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db = cluster["dorysta_bot"]
 tickets_col = db["tickets"]
 counters_col = db["counters"]
+
+_indexes_ready = False
+
+
+async def ensure_indexes():
+    """Создаёт индексы один раз при старте. Без них count_documents/aggregate/find
+    на растущей коллекции превращаются в полный скан — это и есть основная причина
+    растущей задержки ответов."""
+    global _indexes_ready
+    if _indexes_ready:
+        return
+    await asyncio.gather(
+        tickets_col.create_index("ticket_id", unique=True),
+        tickets_col.create_index("transcript_url", unique=True),
+        tickets_col.create_index([("staff_id", ASCENDING), ("created_at", DESCENDING)]),
+        tickets_col.create_index([("author_id", ASCENDING), ("created_at", DESCENDING)]),
+        tickets_col.create_index("staff_id"),
+        tickets_col.create_index("author_id"),
+        tickets_col.create_index("created_at"),
+    )
+    _indexes_ready = True
 
 
 async def get_next_ticket_id() -> int:
@@ -58,6 +81,11 @@ VALID_CATEGORIES = [
     "Получение роли",
     "Покупка рекламы"
 ]
+
+# Простой TTL-кэш пользователей, чтобы не дёргать Discord API (fetch_user)
+# на каждый вызов команды с одним и тем же ID.
+_user_cache: dict[int, tuple[discord.User, float]] = {}
+USER_CACHE_TTL = 300  # 5 минут
 
 
 def has_role_access(user: discord.Member | discord.User, role_ids: list[int]) -> bool:
@@ -168,21 +196,29 @@ def validate_addticket_args(transcript_url: str, category: str) -> tuple[bool, s
 
 
 async def is_transcript_exists(transcript_url: str) -> bool:
-    return (await tickets_col.find_one({"transcript_url": transcript_url})) is not None
+    return (await tickets_col.find_one({"transcript_url": transcript_url}, {"_id": 1})) is not None
 
 
 async def get_user_fast(user_id: int) -> discord.User | None:
+    now = datetime.utcnow().timestamp()
+    cached = _user_cache.get(user_id)
+    if cached and now - cached[1] < USER_CACHE_TTL:
+        return cached[0]
+
     user = bot.get_user(user_id)
-    if user:
-        return user
-    try:
-        return await bot.fetch_user(user_id)
-    except (discord.NotFound, discord.HTTPException):
-        return None
+    if not user:
+        try:
+            user = await bot.fetch_user(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            return None
+
+    _user_cache[user_id] = (user, now)
+    return user
 
 
 @bot.event
 async def on_ready():
+    await ensure_indexes()
     await bot.tree.sync()
     print(f"Bot logged in as {bot.user} with Motor connected!")
 
@@ -231,14 +267,19 @@ async def process_add_ticket(author_user: discord.User, staff_user: discord.User
     ticket_id = await get_next_ticket_id()
     now = datetime.utcnow()
 
-    await tickets_col.insert_one({
-        "ticket_id": ticket_id,
-        "staff_id": staff_user.id,
-        "author_id": author_user.id,
-        "transcript_url": transcript_url,
-        "category": category,
-        "created_at": now
-    })
+    try:
+        await tickets_col.insert_one({
+            "ticket_id": ticket_id,
+            "staff_id": staff_user.id,
+            "author_id": author_user.id,
+            "transcript_url": transcript_url,
+            "category": category,
+            "created_at": now
+        })
+    except DuplicateKeyError:
+        # Подстраховка от гонки: если тот же transcript_url успели вставить
+        # между проверкой is_transcript_exists и insert_one.
+        raise ValueError("этот транскрипт уже внесен")
 
     monthly_count = await get_monthly_tickets(staff_user.id)
     timestamp = int(now.timestamp())
@@ -317,21 +358,33 @@ async def process_ticket_stats(target_user: discord.User):
     date_7_days = now - timedelta(days=7)
     date_30_days = now - timedelta(days=30)
 
-    count_7_staff = await tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": date_7_days}})
-    count_30_staff = await tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": date_30_days}})
-    count_all_staff = await tickets_col.count_documents({"staff_id": target_user.id})
+    # Все 8 запросов независимы друг от друга — выполняем их параллельно,
+    # а не последовательно. Это главный источник задержки при статистике.
+    (
+        count_7_staff,
+        count_30_staff,
+        count_all_staff,
+        count_7_author,
+        count_30_author,
+        count_all_author,
+        last_staff_doc,
+        last_author_doc,
+    ) = await asyncio.gather(
+        tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": date_7_days}}),
+        tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": date_30_days}}),
+        tickets_col.count_documents({"staff_id": target_user.id}),
+        tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": date_7_days}}),
+        tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": date_30_days}}),
+        tickets_col.count_documents({"author_id": target_user.id}),
+        tickets_col.find_one({"staff_id": target_user.id}, sort=[("ticket_id", DESCENDING)]),
+        tickets_col.find_one({"author_id": target_user.id}, sort=[("ticket_id", DESCENDING)]),
+    )
 
-    count_7_author = await tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": date_7_days}})
-    count_30_author = await tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": date_30_days}})
-    count_all_author = await tickets_col.count_documents({"author_id": target_user.id})
-
-    last_staff_doc = await tickets_col.find_one({"staff_id": target_user.id}, sort=[("ticket_id", DESCENDING)])
     if last_staff_doc and isinstance(last_staff_doc.get("created_at"), datetime):
         last_staff_str = f"<t:{int(last_staff_doc['created_at'].timestamp())}:R>"
     else:
         last_staff_str = "—"
 
-    last_author_doc = await tickets_col.find_one({"author_id": target_user.id}, sort=[("ticket_id", DESCENDING)])
     if last_author_doc and isinstance(last_author_doc.get("created_at"), datetime):
         last_author_str = f"<t:{int(last_author_doc['created_at'].timestamp())}:R>"
     else:
@@ -378,7 +431,7 @@ async def process_leaderboard():
         match_stage = {"$match": {field: {"$ne": 0}}}
         if min_date:
             match_stage["$match"]["created_at"] = {"$gte": min_date}
-        
+
         pipeline = [
             match_stage,
             {"$group": {"_id": f"${field}", "cnt": {"$sum": 1}}},
@@ -388,13 +441,22 @@ async def process_leaderboard():
         cursor = tickets_col.aggregate(pipeline)
         return await cursor.to_list(length=5)
 
-    top_7_staff = await get_top_users("staff_id", date_7_days)
-    top_30_staff = await get_top_users("staff_id", date_30_days)
-    top_all_staff = await get_top_users("staff_id")
-
-    top_7_author = await get_top_users("author_id", date_7_days)
-    top_30_author = await get_top_users("author_id", date_30_days)
-    top_all_author = await get_top_users("author_id")
+    # 6 независимых агрегаций — запускаем параллельно вместо последовательного await.
+    (
+        top_7_staff,
+        top_30_staff,
+        top_all_staff,
+        top_7_author,
+        top_30_author,
+        top_all_author,
+    ) = await asyncio.gather(
+        get_top_users("staff_id", date_7_days),
+        get_top_users("staff_id", date_30_days),
+        get_top_users("staff_id"),
+        get_top_users("author_id", date_7_days),
+        get_top_users("author_id", date_30_days),
+        get_top_users("author_id"),
+    )
 
     def format_top(top_list, unit_label="тикетов"):
         if not top_list:
@@ -598,21 +660,32 @@ async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcr
         )
         return
 
-    if await is_transcript_exists(transcript):
-        await interaction.response.send_message(
-            "<:bruh:1521904409582375174> этот транскрипт уже внесен", ephemeral=True
-        )
+    # Дальше идут обращения к базе/API Discord — сначала ack, чтобы не словить
+    # "The application did not respond" при задержке ответа Mongo/Discord.
+    await interaction.response.defer()
+
+    transcript_exists, staff_user = await asyncio.gather(
+        is_transcript_exists(transcript),
+        get_user_fast(staff_id),
+    )
+
+    if transcript_exists:
+        await interaction.followup.send("<:bruh:1521904409582375174> этот транскрипт уже внесен")
         return
 
-    staff_user = await get_user_fast(staff_id)
     if not staff_user:
-        await interaction.response.send_message(
-            f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff}`.", ephemeral=True
+        await interaction.followup.send(
+            f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff}`."
         )
         return
 
-    embed = await process_add_ticket(interaction.user, staff_user, transcript, category)
-    await interaction.response.send_message(embed=embed)
+    try:
+        embed = await process_add_ticket(interaction.user, staff_user, transcript, category)
+    except ValueError as e:
+        await interaction.followup.send(f"<:bruh:1521904409582375174> {e}")
+        return
+
+    await interaction.followup.send(embed=embed)
 
 
 @slash_add_ticket.error
@@ -631,46 +704,51 @@ async def slash_add_ticket_error(interaction: discord.Interaction, error: app_co
 @app_commands.describe(staff="Участник персонала, чью статистику нужно проверить")
 @check_support_slash()
 async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.User = None):
+    await interaction.response.defer()
     target_user = staff or interaction.user
     embed = await process_ticket_stats(target_user)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="ticketlogs", description="Посмотреть тикеты пользователя")
 @app_commands.describe(staff="Участник персонала", page="Номер страницы (по умолчанию 1)")
 @check_transcript_slash()
 async def slash_ticket_logs(interaction: discord.Interaction, staff: discord.User = None, page: int = 1):
+    await interaction.response.defer()
     target_user = staff or interaction.user
     embed = await process_ticket_logs(target_user, page)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="leaderboard", description="Посмотреть топ модераторов по тикетам и транскриптам")
 @check_support_slash()
 async def slash_leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer()
     embed = await process_leaderboard()
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="deleteticket", description="Удалить тикет по номеру лога (Только для Админов)")
 @app_commands.describe(log_id="Номер лога, который нужно удалить")
 @check_admin_slash()
 async def slash_delete_ticket(interaction: discord.Interaction, log_id: int):
+    await interaction.response.defer()
     ticket = await delete_ticket(log_id)
     if not ticket:
-        await interaction.response.send_message(
-            f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден.", ephemeral=True
+        await interaction.followup.send(
+            f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден."
         )
         return
-    await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
+    await interaction.followup.send(f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
 
 
 @bot.tree.command(name="resettickets", description="Удалить все логи модератора (Только для Админов)")
 @app_commands.describe(staff="Модератор, чьи логи удалить (Укажите пользователя)")
 @check_admin_slash()
 async def slash_reset_tickets(interaction: discord.Interaction, staff: discord.User):
+    await interaction.response.defer()
     count = await reset_tickets(staff.id)
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`."
     )
 
@@ -721,16 +799,25 @@ async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
         await ctx.send("<:bruh:1521904409582375174> Вы не можете занести тикет, который провели сами!")
         return
 
-    if await is_transcript_exists(transcript):
+    transcript_exists, staff_user = await asyncio.gather(
+        is_transcript_exists(transcript),
+        get_user_fast(staff_id),
+    )
+
+    if transcript_exists:
         await ctx.send("<:bruh:1521904409582375174> этот транскрипт уже внесен")
         return
 
-    staff_user = await get_user_fast(staff_id)
     if not staff_user:
         await ctx.send(f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff_id}`.")
         return
 
-    embed = await process_add_ticket(ctx.author, staff_user, transcript, category)
+    try:
+        embed = await process_add_ticket(ctx.author, staff_user, transcript, category)
+    except ValueError as e:
+        await ctx.send(f"<:bruh:1521904409582375174> {e}")
+        return
+
     await ctx.send(embed=embed)
 
 
