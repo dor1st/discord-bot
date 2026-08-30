@@ -1,39 +1,48 @@
 import os
 import math
-import sqlite3
 from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from pymongo import MongoClient, DESCENDING, ASCENDING
 
 load_dotenv()
 
-# ================= НАСТРОЙКИ БАЗЫ ДАННЫХ И БОТА =================
+# ================= НАСТРОЙКИ БАЗЫ ДАННЫХ MONGODB И БОТА =================
 
-conn = sqlite3.connect("tickets.db")
-cursor = conn.cursor()
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise ValueError("Ошибка: MONGO_URI не найден в файле .env или Variables Railway")
 
-# Создаём таблицу с колонкой author_id
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS tickets (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    staff_id INTEGER NOT NULL,
-    author_id INTEGER NOT NULL DEFAULT 0,
-    transcript_url TEXT UNIQUE,
-    category TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
-conn.commit()
+# Подключение к MongoDB Atlas с таймаутом для Railway
+mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 
-# Автоматическая миграция БД
-cursor.execute("PRAGMA table_info(tickets)")
-columns = [column[1] for column in cursor.fetchall()]
-if "author_id" not in columns:
-    cursor.execute("ALTER TABLE tickets ADD COLUMN author_id INTEGER NOT NULL DEFAULT 0")
-    conn.commit()
+try:
+    mongo_client.admin.command('ping')
+    print("Успешное подключение к MongoDB Atlas!")
+except Exception as e:
+    print(f"Ошибка подключения к MongoDB: {e}")
+
+db = mongo_client["discord_tickets_db"]
+
+# Коллекция для хранения тикетов и автоинкремент счетчика
+tickets_col = db["tickets"]
+counters_col = db["counters"]
+
+# Индекс для предотвращения дублирования транскриптов
+tickets_col.create_index("transcript_url", unique=True, sparse=True)
+
+def get_next_sequence_value(sequence_name: str) -> int:
+    """Генерирует автоинкрементный ID (аналог AUTOINCREMENT в SQLite)."""
+    seq = counters_col.find_one_and_update(
+        {"_id": sequence_name},
+        {"$inc": {"sequence_value": 1}},
+        upsert=True,
+        return_document=True
+    )
+    return seq["sequence_value"]
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -45,10 +54,8 @@ FOOTER_TEXT = "ТУСОВКА ДОРИСТА"
 
 # ================= НАСТРОЙКА РОЛЕЙ И КАНАЛОВ =================
 
-# Единый список разрешённых каналов для обычных пользователей
 ALLOWED_CHANNEL_IDS = [1322968592202993746, 1537220150267220018]
 
-# Настройки ролей
 SUPPORT_ROLE_IDS = [1502684875868737796, 1322962317885046844]
 TRANSCRIPT_ROLE_IDS = [1502684875868737796, 1322962317885046844]
 ADMIN_ROLE_IDS = [1502684875868737796, 1322962317885046844]
@@ -58,7 +65,6 @@ VALID_CATEGORIES = ["Помощь по серверу", "Получение пр
 # ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ПРОВЕРКИ =================
 
 def has_role_access(user: discord.Member | discord.User, role_ids: list[int]) -> bool:
-    """Проверяет права Администратора или наличие хотя бы одной роли."""
     if not isinstance(user, discord.Member):
         return False
     if user.guild_permissions.administrator:
@@ -69,11 +75,9 @@ def is_admin_user(user: discord.Member | discord.User) -> bool:
     return has_role_access(user, ADMIN_ROLE_IDS)
 
 def check_access(user: discord.Member | discord.User, channel_id: int, role_ids: list[int]) -> tuple[bool, str]:
-    """Универсальная проверка: Админам можно везде, остальным — по ролям и разрешённым каналам."""
     if not isinstance(user, discord.Member):
         return False, "Команды работают только на сервере."
 
-    # Администраторам разрешено всё и везде
     if user.guild_permissions.administrator:
         return True, ""
 
@@ -87,7 +91,6 @@ def check_access(user: discord.Member | discord.User, channel_id: int, role_ids:
     return True, ""
 
 def get_user_group_name(user: discord.Member | discord.User, channel_id: int) -> str:
-    """Определяет группу пользователя без лишних вызовов проверок."""
     if is_admin_user(user):
         return "Администрация"
     if has_role_access(user, TRANSCRIPT_ROLE_IDS):
@@ -95,8 +98,6 @@ def get_user_group_name(user: discord.Member | discord.User, channel_id: int) ->
     if has_role_access(user, SUPPORT_ROLE_IDS):
         return "Support"
     return "Пользователь"
-
-# --- Декораторы проверок ---
 
 def check_access_decorator(role_ids: list[int], is_slash: bool = False):
     async def predicate(target):
@@ -120,8 +121,7 @@ def is_valid_addticket(transcript_url: str, category: str) -> bool:
     return "https://discord.com/" in transcript_url and category in VALID_CATEGORIES
 
 def is_transcript_exists(transcript_url: str) -> bool:
-    cursor.execute("SELECT 1 FROM tickets WHERE transcript_url = ?", (transcript_url,))
-    return cursor.fetchone() is not None
+    return tickets_col.find_one({"transcript_url": transcript_url}) is not None
 
 @bot.event
 async def on_ready():
@@ -152,19 +152,27 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ================= БИЗНЕС-ЛОГИКА ТИКЕТОВ =================
 
 def get_monthly_tickets(staff_id: int) -> int:
-    date_30_days = datetime.now() - timedelta(days=30)
-    cursor.execute("SELECT COUNT(*) FROM tickets WHERE staff_id = ? AND created_at >= ?", (staff_id, date_30_days))
-    return cursor.fetchone()[0]
+    date_30_days = datetime.utcnow() - timedelta(days=30)
+    return tickets_col.count_documents({
+        "staff_id": staff_id,
+        "created_at": {"$gte": date_30_days}
+    })
 
 def process_add_ticket(author_user: discord.User, staff_user: discord.User, transcript_url: str, category: str):
-    cursor.execute(
-        "INSERT INTO tickets (staff_id, author_id, transcript_url, category) VALUES (?, ?, ?, ?)",
-        (staff_user.id, author_user.id, transcript_url, category),
-    )
-    conn.commit()
+    ticket_id = get_next_sequence_value("ticket_id")
+    now = datetime.utcnow()
+
+    tickets_col.insert_one({
+        "_id": ticket_id,
+        "staff_id": staff_user.id,
+        "author_id": author_user.id,
+        "transcript_url": transcript_url,
+        "category": category,
+        "created_at": now
+    })
 
     monthly_count = get_monthly_tickets(staff_user.id)
-    discord_timestamp = f"<t:{int(datetime.now().timestamp())}:F>"
+    discord_timestamp = f"<t:{int(now.timestamp())}:F>"
 
     embed = discord.Embed(title=f"<:logs:1522340749998428160> Лог тикета — {staff_user.display_name}", color=EMBED_COLOR)
     embed.add_field(name="Дата транскрипта", value=discord_timestamp, inline=False)
@@ -177,8 +185,7 @@ def process_add_ticket(author_user: discord.User, staff_user: discord.User, tran
     return embed
 
 def process_ticket_logs(target_user: discord.User, page: int = 1):
-    cursor.execute("SELECT id, transcript_url, category, created_at FROM tickets WHERE staff_id = ? ORDER BY id ASC", (target_user.id,))
-    logs = cursor.fetchall()
+    logs = list(tickets_col.find({"staff_id": target_user.id}).sort("_id", ASCENDING))
 
     if not logs:
         embed = discord.Embed(
@@ -201,12 +208,16 @@ def process_ticket_logs(target_user: discord.User, page: int = 1):
     embed.description = f"{target_user.id}\n" + "—" * 28
 
     lines = []
-    for log_id, transcript_url, category, created_at in current_logs:
-        try:
-            dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
-            formatted_date = f"<t:{int(dt.timestamp())}:F>"
-        except (ValueError, TypeError):
-            formatted_date = created_at
+    for doc in current_logs:
+        log_id = doc["_id"]
+        transcript_url = doc["transcript_url"]
+        category = doc["category"]
+        created_at = doc["created_at"]
+
+        if isinstance(created_at, datetime):
+            formatted_date = f"<t:{int(created_at.timestamp())}:F>"
+        else:
+            formatted_date = str(created_at)
 
         lines.append(
             f"**Тикет №{log_id}**\n"
@@ -221,37 +232,28 @@ def process_ticket_logs(target_user: discord.User, page: int = 1):
     return embed
 
 def process_ticket_stats(target_user: discord.User):
-    now = datetime.now()
+    now = datetime.utcnow()
     d7 = now - timedelta(days=7)
     d30 = now - timedelta(days=30)
 
-    # Оптимизированный единый SQL-запрос для подсчета статистики
-    cursor.execute("""
-        SELECT 
-            SUM(CASE WHEN staff_id = ? AND created_at >= ? THEN 1 ELSE 0 END),
-            SUM(CASE WHEN staff_id = ? AND created_at >= ? THEN 1 ELSE 0 END),
-            SUM(CASE WHEN staff_id = ? THEN 1 ELSE 0 END),
-            SUM(CASE WHEN author_id = ? AND created_at >= ? THEN 1 ELSE 0 END),
-            SUM(CASE WHEN author_id = ? AND created_at >= ? THEN 1 ELSE 0 END),
-            SUM(CASE WHEN author_id = ? THEN 1 ELSE 0 END)
-        FROM tickets
-    """, (target_user.id, d7, target_user.id, d30, target_user.id,
-          target_user.id, d7, target_user.id, d30, target_user.id))
-    
-    c7_s, c30_s, call_s, c7_a, c30_a, call_a = [v or 0 for v in cursor.fetchone()]
+    c7_s = tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": d7}})
+    c30_s = tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": d30}})
+    call_s = tickets_col.count_documents({"staff_id": target_user.id})
 
-    # Последний проведенный и внесенный тикеты
-    cursor.execute("SELECT created_at FROM tickets WHERE staff_id = ? ORDER BY id DESC LIMIT 1", (target_user.id,))
-    l_s = cursor.fetchone()
-    cursor.execute("SELECT created_at FROM tickets WHERE author_id = ? ORDER BY id DESC LIMIT 1", (target_user.id,))
-    l_a = cursor.fetchone()
+    c7_a = tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": d7}})
+    c30_a = tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": d30}})
+    call_a = tickets_col.count_documents({"author_id": target_user.id})
 
-    def fmt_last(row):
-        if not row: return "—"
-        try:
-            return f"<t:{int(datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').timestamp())}:R>"
-        except (ValueError, TypeError):
-            return str(row[0])
+    l_s_doc = tickets_col.find_one({"staff_id": target_user.id}, sort=[("_id", DESCENDING)])
+    l_a_doc = tickets_col.find_one({"author_id": target_user.id}, sort=[("_id", DESCENDING)])
+
+    def fmt_last(doc):
+        if not doc:
+            return "—"
+        dt = doc.get("created_at")
+        if isinstance(dt, datetime):
+            return f"<t:{int(dt.timestamp())}:R>"
+        return str(dt)
 
     embed = discord.Embed(color=EMBED_COLOR)
     embed.set_author(name=target_user.name, icon_url=target_user.display_avatar.url)
@@ -261,29 +263,36 @@ def process_ticket_stats(target_user: discord.User):
     embed.add_field(name="За всё время:", value=f"• Тикетов: **{call_s}**\n• Транскриптов: **{call_a}**", inline=True)
     embed.add_field(
         name="<:lighting:1522337543360872489> Активность:",
-        value=f"• **Последний проведённый тикет:** {fmt_last(l_s)}\n• **Последний внесённый транскрипт:** {fmt_last(l_a)}",
+        value=f"• **Последний проведённый тикет:** {fmt_last(l_s_doc)}\n• **Последний внесённый транскрипт:** {fmt_last(l_a_doc)}",
         inline=False
     )
     embed.set_footer(text=f"ID: {target_user.id} • Сегодня в {now.strftime('%H:%M')} • {FOOTER_TEXT}")
     return embed
 
 def process_leaderboard():
-    now = datetime.now()
+    now = datetime.utcnow()
     d7 = now - timedelta(days=7)
     d30 = now - timedelta(days=30)
 
-    def get_top(column: str, min_date=None, exclude_zero=False):
-        where_clauses = []
-        params = []
+    def get_top(field: str, min_date=None, exclude_zero=False):
+        match_stage = {}
         if min_date:
-            where_clauses.append("created_at >= ?")
-            params.append(min_date)
+            match_stage["created_at"] = {"$gte": min_date}
         if exclude_zero:
-            where_clauses.append(f"{column} != 0")
-        
-        where_str = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-        cursor.execute(f"SELECT {column}, COUNT(*) as cnt FROM tickets {where_str} GROUP BY {column} ORDER BY cnt DESC LIMIT 5", params)
-        return cursor.fetchall()
+            match_stage[field] = {"$ne": 0}
+
+        pipeline = []
+        if match_stage:
+            pipeline.append({"$match": match_stage})
+
+        pipeline.extend([
+            {"$group": {"_id": f"${field}", "cnt": {"$sum": 1}}},
+            {"$sort": {"cnt": -1}},
+            {"$limit": 5}
+        ])
+
+        results = list(tickets_col.aggregate(pipeline))
+        return [(doc["_id"], doc["cnt"]) for doc in results]
 
     def format_top(top_list, unit_label="тикетов"):
         if not top_list:
@@ -291,7 +300,7 @@ def process_leaderboard():
         return "\n".join([f"`{idx}.` <@{u_id}> — **{count}** {unit_label}" for idx, (u_id, count) in enumerate(top_list, 1)])
 
     embed = discord.Embed(title="<:ticket:1522343287816716379> Лидерборд тикетов и транскриптов", color=EMBED_COLOR)
-    
+
     embed.add_field(name="<:ticket:1522343287816716379> Проведено тикетов (7 дн.)", value=format_top(get_top("staff_id", d7)), inline=True)
     embed.add_field(name="<:logs:1522340749998428160> Внесёно транскриптов (7 дн.)", value=format_top(get_top("author_id", d7, True), "транскриптов"), inline=True)
     embed.add_field(name="\u200b", value="\u200b", inline=True)
@@ -308,19 +317,11 @@ def process_leaderboard():
     return embed
 
 def delete_ticket(log_id: int):
-    cursor.execute("SELECT id, staff_id FROM tickets WHERE id = ?", (log_id,))
-    ticket = cursor.fetchone()
-    if ticket:
-        cursor.execute("DELETE FROM tickets WHERE id = ?", (log_id,))
-        conn.commit()
-    return ticket
+    return tickets_col.find_one_and_delete({"_id": log_id})
 
 def reset_tickets(staff_id: int) -> int:
-    cursor.execute("SELECT COUNT(*) FROM tickets WHERE staff_id = ? OR author_id = ?", (staff_id, staff_id))
-    count = cursor.fetchone()[0]
-    cursor.execute("DELETE FROM tickets WHERE staff_id = ? OR author_id = ?", (staff_id, staff_id))
-    conn.commit()
-    return count
+    res = tickets_col.delete_many({"$or": [{"staff_id": staff_id}, {"author_id": staff_id}]})
+    return res.deleted_count
 
 # ================= EMBEDS ПОМОЩИ =================
 
