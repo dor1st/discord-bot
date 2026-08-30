@@ -22,6 +22,10 @@ if not TOKEN:
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL not found. Please add MONGO_URL to your environment variables.")
 
+# ВАЖНО: используем motor (async-клиент), а не pymongo.MongoClient.
+# Синхронный pymongo внутри discord.py блокирует весь event loop бота на
+# время каждого запроса к базе — именно это и было главной причиной
+# зависаний/задержек и "бот не отвечает".
 cluster = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db = cluster["dorysta_bot"]
 tickets_col = db["tickets"]
@@ -209,31 +213,49 @@ async def get_user_fast(user_id: int) -> discord.User | None:
     _user_cache[user_id] = (user, now)
     return user
 
+
 _startup_notified = False
 
+
 async def send_restart_embed():
+    """Отправляет embed о перезапуске бота в канал UPDATE_ID_CHANNEL.
+    on_ready может срабатывать не только при старте процесса, но и при
+    каждом переподключении к Discord gateway (обрыв сети и т.п.) — флаг
+    ниже гарантирует, что embed уйдёт один раз за время жизни процесса,
+    а не при каждом таком reconnect."""
     global _startup_notified
     if _startup_notified:
         return
+
     channel = bot.get_channel(UPDATE_ID_CHANNEL)
     if channel is None:
+        print(f"send_restart_embed: канал {UPDATE_ID_CHANNEL} не найден (бот не в гильдии или неверный ID).")
         return
+
     timestamp = int(datetime.utcnow().timestamp())
     embed = discord.Embed(
         title="<a:gif_verify:1522328481956888686> Бот запущен",
-        description=f"Бот успешно перезапущен и готов к работе.\n**Время запуска:** <t:{timestamp}:F> (<t:{timestamp}:R>)",
+        description=(
+            f"Бот успешно перезапущен и готов к работе.\n"
+            f"**Время запуска:** <t:{timestamp}:F> (<t:{timestamp}:R>)"
+        ),
         color=EMBED_COLOR,
     )
     embed.set_footer(text=FOOTER_TEXT)
-    await channel.send(embed=embed)
-    _startup_notified = True
+
+    try:
+        await channel.send(embed=embed)
+        _startup_notified = True
+    except discord.HTTPException as e:
+        print(f"send_restart_embed: не удалось отправить embed: {e!r}")
+
 
 @bot.event
 async def on_ready():
     await ensure_indexes()
     await bot.tree.sync()
-    await send_restart_embed()
     print(f"Bot logged in as {bot.user} with Motor connected!")
+    await send_restart_embed()
 
 
 @bot.event
@@ -251,10 +273,15 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     if isinstance(error, app_commands.CommandNotFound):
         return
     msg = f"<:bruh:1521904409582375174> {error}" if str(error) else "<:bruh:1521904409582375174> Произошла ошибка при выполнении команды."
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except discord.NotFound:
+        print(f"on_app_command_error: interaction {interaction.id} уже недоступен (404), не смог отправить: {msg!r}")
+    except discord.HTTPException as e:
+        print(f"on_app_command_error: не удалось отправить сообщение об ошибке: {e!r}")
 
 
 async def get_monthly_tickets(staff_id: int) -> int:
@@ -655,6 +682,41 @@ def get_resettickets_usage_embed():
     return embed
 
 
+async def safe_defer(interaction: discord.Interaction) -> bool:
+    """Аккуратный defer(): если interaction уже протух (истекли 3 сек. ack-окна —
+    например из-за сетевой задержки или гонки при редеплое, когда старый и новый
+    инстансы бота какое-то время висят в gateway одновременно), не роняем хендлер
+    необработанным исключением, а логируем и возвращаем False."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        return True
+    except discord.NotFound:
+        print(f"safe_defer: interaction {interaction.id} истёк до ack (Unknown interaction / 404).")
+        return False
+    except discord.HTTPException as e:
+        print(f"safe_defer: ошибка при defer(): {e!r}")
+        return False
+
+
+async def safe_followup(interaction: discord.Interaction, **kwargs):
+    """Аккуратный followup.send(): если вебхук взаимодействия уже невалиден
+    (404 Unknown Webhook), пробуем fallback — отправить то же самое прямо в
+    канал, чтобы пользователь не остался без ответа."""
+    try:
+        await interaction.followup.send(**kwargs)
+    except discord.NotFound:
+        print(f"safe_followup: webhook для interaction {interaction.id} не найден (404). Пробую fallback в канал.")
+        channel = interaction.channel
+        if channel is not None:
+            try:
+                await channel.send(**kwargs)
+            except discord.HTTPException as e:
+                print(f"safe_followup: fallback в канал тоже не удался: {e!r}")
+    except discord.HTTPException as e:
+        print(f"safe_followup: ошибка при followup.send(): {e!r}")
+
+
 @bot.tree.command(name="help", description="Показать полный список команд бота")
 @check_support_slash()
 async def slash_help(interaction: discord.Interaction):
@@ -691,7 +753,8 @@ async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcr
 
     # Дальше только запросы к базе/API Discord — сразу ack, чтобы не словить
     # "The application did not respond", если Mongo/Discord ответят не мгновенно.
-    await interaction.response.defer()
+    if not await safe_defer(interaction):
+        return
 
     transcript_exists, staff_user = await asyncio.gather(
         is_transcript_exists(transcript),
@@ -699,22 +762,23 @@ async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcr
     )
 
     if transcript_exists:
-        await interaction.followup.send("<:bruh:1521904409582375174> этот транскрипт уже внесен")
+        await safe_followup(interaction, content="<:bruh:1521904409582375174> этот транскрипт уже внесен")
         return
 
     if not staff_user:
-        await interaction.followup.send(
-            f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff}`."
+        await safe_followup(
+            interaction,
+            content=f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff}`."
         )
         return
 
     try:
         embed = await process_add_ticket(interaction.user, staff_user, transcript, category)
     except ValueError as e:
-        await interaction.followup.send(f"<:bruh:1521904409582375174> {e}")
+        await safe_followup(interaction, content=f"<:bruh:1521904409582375174> {e}")
         return
 
-    await interaction.followup.send(embed=embed)
+    await safe_followup(interaction, embed=embed)
 
 
 @slash_add_ticket.error
@@ -734,52 +798,59 @@ async def slash_add_ticket_error(interaction: discord.Interaction, error: app_co
 @app_commands.describe(staff="Участник персонала, чью статистику нужно проверить")
 @check_support_slash()
 async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.User = None):
-    await interaction.response.defer()
+    if not await safe_defer(interaction):
+        return
     target_user = staff or interaction.user
     embed = await process_ticket_stats(target_user)
-    await interaction.followup.send(embed=embed)
+    await safe_followup(interaction, embed=embed)
 
 
 @bot.tree.command(name="ticketlogs", description="Посмотреть тикеты пользователя")
 @app_commands.describe(staff="Участник персонала", page="Номер страницы (по умолчанию 1)")
 @check_transcript_slash()
 async def slash_ticket_logs(interaction: discord.Interaction, staff: discord.User = None, page: int = 1):
-    await interaction.response.defer()
+    if not await safe_defer(interaction):
+        return
     target_user = staff or interaction.user
     embed = await process_ticket_logs(target_user, page)
-    await interaction.followup.send(embed=embed)
+    await safe_followup(interaction, embed=embed)
 
 
 @bot.tree.command(name="leaderboard", description="Посмотреть топ модераторов по тикетам и транскриптам")
 @check_support_slash()
 async def slash_leaderboard(interaction: discord.Interaction):
-    await interaction.response.defer()
+    if not await safe_defer(interaction):
+        return
     embed = await process_leaderboard()
-    await interaction.followup.send(embed=embed)
+    await safe_followup(interaction, embed=embed)
 
 
 @bot.tree.command(name="deleteticket", description="Удалить тикет по номеру лога (Только для Админов)")
 @app_commands.describe(log_id="Номер лога, который нужно удалить")
 @check_admin_slash()
 async def slash_delete_ticket(interaction: discord.Interaction, log_id: int):
-    await interaction.response.defer()
+    if not await safe_defer(interaction):
+        return
     ticket = await delete_ticket(log_id)
     if not ticket:
-        await interaction.followup.send(
-            f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден."
+        await safe_followup(
+            interaction,
+            content=f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден."
         )
         return
-    await interaction.followup.send(f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
+    await safe_followup(interaction, content=f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
 
 
 @bot.tree.command(name="resettickets", description="Удалить все логи модератора (Только для Админов)")
 @app_commands.describe(staff="Модератор, чьи логи удалить (Укажите пользователя)")
 @check_admin_slash()
 async def slash_reset_tickets(interaction: discord.Interaction, staff: discord.User):
-    await interaction.response.defer()
+    if not await safe_defer(interaction):
+        return
     count = await reset_tickets(staff.id)
-    await interaction.followup.send(
-        f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`."
+    await safe_followup(
+        interaction,
+        content=f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`."
     )
 
 
