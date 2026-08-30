@@ -177,7 +177,8 @@ def process_add_ticket(author_user: discord.User, staff_user: discord.User, tran
     monthly_count = get_monthly_tickets(staff_user.id)
     discord_timestamp = f"<t:{int(now.timestamp())}:F>"
 
-    embed = discord.Embed(title=f"<:logs:1522340749998428160> Лог тикета — {staff_user.display_name}", color=EMBED_COLOR)
+    # Внесено изменение 1: Заголовок теперь включает номер лога
+    embed = discord.Embed(title=f"<:logs:1522340749998428160> Лог №{ticket_id} — {staff_user.display_name}", color=EMBED_COLOR)
     embed.add_field(name="Дата транскрипта", value=discord_timestamp, inline=False)
     embed.add_field(name="Ссылка на транскрипт", value=transcript_url, inline=False)
     embed.add_field(name="Кто вёл тикет", value=str(staff_user.id), inline=False)
@@ -237,7 +238,7 @@ def process_ticket_logs(target_user: discord.User, page: int = 1) -> tuple[disco
 
 class TicketLogsPaginationView(discord.ui.View):
     def __init__(self, author_id: int, target_user: discord.User, total_pages: int, initial_page: int = 1):
-        super().__init__(timeout=120)  # Таймаут активности кнопок — 2 минуты
+        super().__init__(timeout=120)
         self.author_id = author_id
         self.target_user = target_user
         self.total_pages = total_pages
@@ -325,6 +326,7 @@ def process_leaderboard():
     d7 = now - timedelta(days=7)
     d30 = now - timedelta(days=30)
 
+    # Внесено изменение 2: ограничение выборки до ТОП 3
     def get_top(field: str, min_date=None, exclude_zero=False):
         match_stage = {}
         if min_date:
@@ -339,16 +341,22 @@ def process_leaderboard():
         pipeline.extend([
             {"$group": {"_id": f"${field}", "cnt": {"$sum": 1}}},
             {"$sort": {"cnt": -1}},
-            {"$limit": 5}
+            {"$limit": 3}
         ])
 
         results = list(tickets_col.aggregate(pipeline))
         return [(doc["_id"], doc["cnt"]) for doc in results]
 
+    # Внесено изменение 2: Вывод строго 3 мест с прочерками (—) на отсутствующих
     def format_top(top_list, unit_label="тикетов"):
-        if not top_list:
-            return "— *Нет данных*"
-        return "\n".join([f"`{idx}.` <@{u_id}> — **{count}** {unit_label}" for idx, (u_id, count) in enumerate(top_list, 1)])
+        lines = []
+        for i in range(1, 4):
+            if i <= len(top_list):
+                u_id, count = top_list[i - 1]
+                lines.append(f"`{i}.` <@{u_id}> — **{count}** {unit_label}")
+            else:
+                lines.append(f"`{i}.` —")
+        return "\n".join(lines)
 
     embed = discord.Embed(title="<:ticket:1522343287816716379> Лидерборд тикетов и транскриптов", color=EMBED_COLOR)
 
@@ -480,8 +488,14 @@ async def slash_help(interaction: discord.Interaction):
 @check_transcript_slash()
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
 async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcript: str, category: str):
-    if not is_valid_addticket(transcript, category):
-        await interaction.response.send_message(embed=get_addticket_usage_embed(), ephemeral=True)
+    # Внесено изменение 3: Точечный отклик текстом при ошибочных аргументах
+    if "https://discord.com/" not in transcript:
+        await interaction.response.send_message("<:bruh:1521904409582375174> Некорректная ссылка на транскрипт. Она должна содержать `https://discord.com/`.", ephemeral=True)
+        return
+
+    if category not in VALID_CATEGORIES:
+        cats = ", ".join([f"`{c}`" for c in VALID_CATEGORIES])
+        await interaction.response.send_message(f"<:bruh:1521904409582375174> Указана недопустимая категория! Разрешенные: {cats}", ephemeral=True)
         return
 
     try:
@@ -573,19 +587,28 @@ async def prefix_help(ctx: commands.Context):
 @check_transcript_prefix()
 @commands.cooldown(1, 3.0, commands.BucketType.user)
 async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
+    # Внесено изменение 3: Если команда отправлена без аргументов (.t / .addticket) -> отправляется embed с примером
     if not args:
         await ctx.send(embed=get_addticket_usage_embed())
         return
 
     parts = args.split(maxsplit=2)
+    
+    # Внесено изменение 3: Если передано недостаточно аргументов -> отправляется текстовое сообщение
     if len(parts) < 3:
-        await ctx.send(embed=get_addticket_usage_embed())
+        await ctx.send("<:bruh:1521904409582375174> Недостаточно аргументов. Формат: `.addticket [ID модератора] [ссылка] [категория]`")
         return
 
     staff_raw, transcript, category = parts[0], parts[1], parts[2]
 
-    if not is_valid_addticket(transcript, category):
-        await ctx.send(embed=get_addticket_usage_embed())
+    # Внесено изменение 3: Вывод точечных ошибок текстом
+    if "https://discord.com/" not in transcript:
+        await ctx.send("<:bruh:1521904409582375174> Некорректная ссылка на транскрипт. Она должна содержать `https://discord.com/`.")
+        return
+
+    if category not in VALID_CATEGORIES:
+        cats = ", ".join([f"`{c}`" for c in VALID_CATEGORIES])
+        await ctx.send(f"<:bruh:1521904409582375174> Указана недопустимая категория! Разрешенные: {cats}")
         return
 
     try:
@@ -623,7 +646,8 @@ async def prefix_add_ticket_error(ctx: commands.Context, error):
     if isinstance(error, commands.CheckFailure):
         await ctx.send(f"<:bruh:1521904409582375174> {error}")
         return
-    await ctx.send(embed=get_addticket_usage_embed())
+    # Внесено изменение 3: Если произошла неизвестная ошибка синтаксиса
+    await ctx.send("<:bruh:1521904409582375174> Некорректный синтаксис использования команды.")
 
 @bot.command(name="ticketstats", aliases=["ts"])
 @check_support_prefix()
