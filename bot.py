@@ -12,12 +12,12 @@ load_dotenv()
 
 # ================= НАСТРОЙКИ БАЗЫ ДАННЫХ MONGODB И БОТА =================
 
-MONGO_URI = os.getenv("MONGO_URI")
-if not MONGO_URI:
-    raise ValueError("Ошибка: MONGO_URI не найден в файле .env или Variables Railway")
+MONGO_URL = os.getenv("MONGO_URL")
+if not MONGO_URL:
+    raise ValueError("Ошибка: MONGO_URL не найден в файле .env или Variables Railway")
 
 # Подключение к MongoDB Atlas с таймаутом для Railway
-mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+mongo_client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
 
 try:
     mongo_client.admin.command('ping')
