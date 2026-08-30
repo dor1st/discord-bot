@@ -45,10 +45,11 @@ EMBED_COLOR = discord.Color(0x212121)
 FOOTER_TEXT = "ТУСОВКА ДОРИСТА"
 
 ALLOWED_CHANNEL_IDS = [1466886479396737024]
+UPDATE_ID_CHANNEL = int(os.getenv("UPDATE_ID_CHANNEL", 1543654684462424194))
 
-SUPPORT_ROLE_IDS = [1502684875868737796, 1322962317885046844]
-TRANSCRIPT_ROLE_IDS = [1502684875868737796, 1322962317885046844]
-ADMIN_ROLE_IDS = [1502684875868737796, 1322962317885046844]
+SUPPORT_ROLE_IDS = [1501507449860001853, 1322962344040464424]
+TRANSCRIPT_ROLE_IDS = [1542601770461569044, 1323348388762226759]
+ADMIN_ROLE_IDS = [1322962317885046844, 1502684875868737796]
 
 VALID_CATEGORIES = [
     "Помощь по серверу",
@@ -172,6 +173,17 @@ def is_transcript_exists(transcript_url: str) -> bool:
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot logged in as {bot.user} with MongoDB connected!")
+
+    channel = bot.get_channel(UPDATE_ID_CHANNEL)
+    if channel:
+        timestamp = int(datetime.utcnow().timestamp())
+        embed = discord.Embed(
+            title="<a:gif_verify:1522328481956888686> Бот запущен",
+            description=f"Бот успешно перезапущен и готов к работе.\n**Время запуска:** <t:{timestamp}:F> (<t:{timestamp}:R>)",
+            color=EMBED_COLOR
+        )
+        embed.set_footer(text=FOOTER_TEXT)
+        await channel.send(embed=embed)
 
 
 @bot.event
