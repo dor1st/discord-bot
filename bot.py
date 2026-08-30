@@ -439,7 +439,7 @@ def process_leaderboard():
     )
 
     embed.add_field(
-        name="<:ticket:1522343287816716379>🎟️ Проведено тикетов (Топ за 7 дней)",
+        name="<:ticket:1522343287816716379> Проведено тикетов (Топ за 7 дней)",
         value=format_top(top_7_staff, "тикетов"),
         inline=True
     )
