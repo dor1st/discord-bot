@@ -8,6 +8,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import pymongo
 
+# Завантажуємо змінні середовища з .env (для ПК) або з хостингу (Railway)
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -19,6 +20,7 @@ if not TOKEN:
 if not MONGO_URL:
     raise RuntimeError("MONGO_URL not found. Please add MONGO_URL to your environment variables.")
 
+# ================= НАЛАШТУВАННЯ БАЗИ ДАНИХ (MongoDB) =================
 
 cluster = pymongo.MongoClient(MONGO_URL)
 db = cluster["dorysta_bot"]
@@ -27,6 +29,7 @@ counters_col = db["counters"]
 
 
 def get_next_ticket_id() -> int:
+    """Генерує автоінкрементний цифровий ID для тикетів (замість SQLite AUTOINCREMENT)."""
     counter = counters_col.find_one_and_update(
         {"_id": "ticket_id"},
         {"$inc": {"seq": 1}},
@@ -36,6 +39,8 @@ def get_next_ticket_id() -> int:
     return counter["seq"]
 
 
+# ================= НАЛАШТУВАННЯ БОТА =================
+
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -44,19 +49,25 @@ bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
 EMBED_COLOR = discord.Color(0x212121)
 FOOTER_TEXT = "ТУСОВКА ДОРИСТА"
 
-ALLOWED_CHANNEL_IDS = [1466886479396737024]
-
+# Ролі та канали
 SUPPORT_ROLE_IDS = [1502684875868737796, 1322962317885046844]
+SUPPORT_CHANNEL_IDS = [1322968592202993746]
+
 TRANSCRIPT_ROLE_IDS = [1502684875868737796, 1322962317885046844]
+TRANSCRIPT_CHANNEL_IDS = [1537220150267220018]
+
 ADMIN_ROLE_IDS = [1502684875868737796, 1322962317885046844]
 
 VALID_CATEGORIES = [
     "Помощь по серверу",
     "Получение призов",
     "Получение ролей",
-    "Покупка рекламы"
+    "Покупка рекламы",
+    "1",
 ]
 
+
+# ================= ПЕРЕВІРКИ ТА ДОСТУП =================
 
 def has_role_access(user: discord.Member | discord.User, role_ids: list[int]) -> bool:
     if not isinstance(user, discord.Member):
@@ -72,13 +83,13 @@ def is_admin_user(user: discord.Member | discord.User) -> bool:
 
 
 def get_user_group_name(user: discord.Member | discord.User, channel_id: int) -> str:
-    can_admin, _ = check_access(user, channel_id, ADMIN_ROLE_IDS, check_channels=False)
+    can_admin, _ = check_access(user, channel_id, ADMIN_ROLE_IDS, None)
     if can_admin:
         return "Администрация"
-    can_transcript, _ = check_access(user, channel_id, TRANSCRIPT_ROLE_IDS)
+    can_transcript, _ = check_access(user, channel_id, TRANSCRIPT_ROLE_IDS, TRANSCRIPT_CHANNEL_IDS)
     if can_transcript:
         return "Transcript"
-    can_support, _ = check_access(user, channel_id, SUPPORT_ROLE_IDS)
+    can_support, _ = check_access(user, channel_id, SUPPORT_ROLE_IDS, SUPPORT_CHANNEL_IDS)
     if can_support:
         return "Support"
     return "Пользователь"
@@ -88,23 +99,24 @@ def check_access(
     user: discord.Member | discord.User,
     channel_id: int,
     role_ids: list[int],
-    check_channels: bool = True,
+    allowed_channel_ids: list[int] = None,
 ) -> tuple[bool, str]:
     if not isinstance(user, discord.Member):
         return False, "Команды работают только на сервере."
-    if user.guild_permissions.administrator or has_role_access(user, ADMIN_ROLE_IDS):
+    if user.guild_permissions.administrator:
         return True, ""
     if not has_role_access(user, role_ids):
         return False, "У вас недостаточно ролей для использования этой команды."
-    if check_channels and ALLOWED_CHANNEL_IDS and channel_id not in ALLOWED_CHANNEL_IDS:
-        channels_mention = ", ".join([f"<#{cid}>" for cid in ALLOWED_CHANNEL_IDS])
-        return False, f"Эта команда доступна только в каналах: {channels_mention}"
+    if allowed_channel_ids and channel_id not in allowed_channel_ids:
+        channels_mention = ", ".join([f"<#{cid}>" for cid in allowed_channel_ids])
+        return False, f"Эта команда доступна только в канале: {channels_mention}"
     return True, ""
 
 
+# Чеки префіксних команд
 def check_support_prefix():
     async def predicate(ctx: commands.Context):
-        ok, msg = check_access(ctx.author, ctx.channel.id, SUPPORT_ROLE_IDS)
+        ok, msg = check_access(ctx.author, ctx.channel.id, SUPPORT_ROLE_IDS, SUPPORT_CHANNEL_IDS)
         if not ok:
             raise commands.CheckFailure(msg)
         return True
@@ -113,7 +125,7 @@ def check_support_prefix():
 
 def check_transcript_prefix():
     async def predicate(ctx: commands.Context):
-        ok, msg = check_access(ctx.author, ctx.channel.id, TRANSCRIPT_ROLE_IDS)
+        ok, msg = check_access(ctx.author, ctx.channel.id, TRANSCRIPT_ROLE_IDS, TRANSCRIPT_CHANNEL_IDS)
         if not ok:
             raise commands.CheckFailure(msg)
         return True
@@ -122,16 +134,17 @@ def check_transcript_prefix():
 
 def check_admin_prefix():
     async def predicate(ctx: commands.Context):
-        ok, msg = check_access(ctx.author, ctx.channel.id, ADMIN_ROLE_IDS, check_channels=False)
+        ok, msg = check_access(ctx.author, ctx.channel.id, ADMIN_ROLE_IDS, None)
         if not ok:
             raise commands.CheckFailure(msg)
         return True
     return commands.check(predicate)
 
 
+# Чеки слеш-команд
 def check_support_slash():
     async def predicate(interaction: discord.Interaction):
-        ok, msg = check_access(interaction.user, interaction.channel_id, SUPPORT_ROLE_IDS)
+        ok, msg = check_access(interaction.user, interaction.channel_id, SUPPORT_ROLE_IDS, SUPPORT_CHANNEL_IDS)
         if not ok:
             raise app_commands.AppCommandError(msg)
         return True
@@ -140,7 +153,7 @@ def check_support_slash():
 
 def check_transcript_slash():
     async def predicate(interaction: discord.Interaction):
-        ok, msg = check_access(interaction.user, interaction.channel_id, TRANSCRIPT_ROLE_IDS)
+        ok, msg = check_access(interaction.user, interaction.channel_id, TRANSCRIPT_ROLE_IDS, TRANSCRIPT_CHANNEL_IDS)
         if not ok:
             raise app_commands.AppCommandError(msg)
         return True
@@ -149,7 +162,7 @@ def check_transcript_slash():
 
 def check_admin_slash():
     async def predicate(interaction: discord.Interaction):
-        ok, msg = check_access(interaction.user, interaction.channel_id, ADMIN_ROLE_IDS, check_channels=False)
+        ok, msg = check_access(interaction.user, interaction.channel_id, ADMIN_ROLE_IDS, None)
         if not ok:
             raise app_commands.AppCommandError(msg)
         return True
@@ -174,6 +187,8 @@ async def on_ready():
     print(f"Bot logged in as {bot.user} with MongoDB connected!")
 
 
+# ================= ОБРОБКА ПОМИЛОК =================
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
@@ -194,6 +209,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     else:
         await interaction.response.send_message(msg, ephemeral=True)
 
+
+# ================= ЛОГІКА ТИКЕТІВ (MongoDB) =================
 
 def get_monthly_tickets(staff_id: int) -> int:
     date_30_days = datetime.utcnow() - timedelta(days=30)
@@ -435,10 +452,12 @@ def reset_tickets(staff_id: int) -> int:
     return result.deleted_count
 
 
+# ================= EMBEDS ПОМОЩИ =================
+
 def get_help_embed(user: discord.Member | discord.User, channel_id: int):
-    can_support, _ = check_access(user, channel_id, SUPPORT_ROLE_IDS)
-    can_transcript, _ = check_access(user, channel_id, TRANSCRIPT_ROLE_IDS)
-    can_admin, _ = check_access(user, channel_id, ADMIN_ROLE_IDS, check_channels=False)
+    can_support, _ = check_access(user, channel_id, SUPPORT_ROLE_IDS, SUPPORT_CHANNEL_IDS)
+    can_transcript, _ = check_access(user, channel_id, TRANSCRIPT_ROLE_IDS, TRANSCRIPT_CHANNEL_IDS)
+    can_admin, _ = check_access(user, channel_id, ADMIN_ROLE_IDS, None)
 
     group_name = get_user_group_name(user, channel_id)
 
@@ -571,6 +590,8 @@ def get_resettickets_usage_embed():
     return embed
 
 
+# ================= СЛЭШ-КОМАНДЫ =================
+
 @bot.tree.command(name="help", description="Показать полный список команд бота")
 @check_support_slash()
 async def slash_help(interaction: discord.Interaction):
@@ -682,6 +703,8 @@ async def slash_reset_tickets(interaction: discord.Interaction, staff: discord.U
         f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`."
     )
 
+
+# ================= ПРЕФІКСНІ КОМАНДИ =================
 
 @bot.command(name="help")
 @check_support_prefix()
@@ -817,5 +840,6 @@ async def prefix_reset_tickets_error(ctx: commands.Context, error):
         return
 
 
+# Запуск бота
 if __name__ == "__main__":
     bot.run(TOKEN)
