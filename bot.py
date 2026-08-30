@@ -1,6 +1,6 @@
 import os
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
@@ -152,7 +152,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ================= БИЗНЕС-ЛОГИКА ТИКЕТОВ =================
 
 def get_monthly_tickets(staff_id: int) -> int:
-    date_30_days = datetime.utcnow() - timedelta(days=30)
+    date_30_days = datetime.now(timezone.utc) - timedelta(days=30)
     return tickets_col.count_documents({
         "staff_id": staff_id,
         "created_at": {"$gte": date_30_days}
@@ -160,7 +160,7 @@ def get_monthly_tickets(staff_id: int) -> int:
 
 def process_add_ticket(author_user: discord.User, staff_user: discord.User, transcript_url: str, category: str):
     ticket_id = get_next_sequence_value("ticket_id")
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     tickets_col.insert_one({
         "_id": ticket_id,
@@ -184,7 +184,7 @@ def process_add_ticket(author_user: discord.User, staff_user: discord.User, tran
     embed.set_footer(text=FOOTER_TEXT)
     return embed
 
-def process_ticket_logs(target_user: discord.User, page: int = 1):
+def process_ticket_logs(target_user: discord.User, page: int = 1) -> tuple[discord.Embed, int]:
     logs = list(tickets_col.find({"staff_id": target_user.id}).sort("_id", ASCENDING))
 
     if not logs:
@@ -194,7 +194,7 @@ def process_ticket_logs(target_user: discord.User, page: int = 1):
             color=EMBED_COLOR,
         )
         embed.set_footer(text=f"Страница 1/1 (0 логов) • {FOOTER_TEXT}")
-        return embed
+        return embed, 1
 
     items_per_page = 5
     total_logs = len(logs)
@@ -229,10 +229,59 @@ def process_ticket_logs(target_user: discord.User, page: int = 1):
 
     embed.description += "\n\n" + "\n\n".join(lines)
     embed.set_footer(text=f"Страница {current_page}/{total_pages} ({total_logs} логов) • {FOOTER_TEXT}")
-    return embed
+    return embed, total_pages
+
+# ================= КОМПОНЕНТ НАВИГАЦИИ (КНОПКИ СТРАНИЦ) =================
+
+class TicketLogsPaginationView(discord.ui.View):
+    def __init__(self, author_id: int, target_user: discord.User, total_pages: int, initial_page: int = 1):
+        super().__init__(timeout=120)  # Таймаут активности кнопок — 2 минуты
+        self.author_id = author_id
+        self.target_user = target_user
+        self.total_pages = total_pages
+        self.current_page = initial_page
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = (self.current_page <= 1)
+        self.next_button.disabled = (self.current_page >= self.total_pages)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "<:bruh:1521904409582375174> Вы не можете переключать страницы в чужом меню.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page > 1:
+            self.current_page -= 1
+            embed, _ = process_ticket_logs(self.target_user, self.current_page)
+            self.update_buttons()
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            embed, _ = process_ticket_logs(self.target_user, self.current_page)
+            self.update_buttons()
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        try:
+            if hasattr(self, 'message') and self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
 
 def process_ticket_stats(target_user: discord.User):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     d7 = now - timedelta(days=7)
     d30 = now - timedelta(days=30)
 
@@ -270,7 +319,7 @@ def process_ticket_stats(target_user: discord.User):
     return embed
 
 def process_leaderboard():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     d7 = now - timedelta(days=7)
     d30 = now - timedelta(days=30)
 
@@ -350,7 +399,7 @@ def get_help_embed(user: discord.Member | discord.User, channel_id: int):
             name="<:logs:1522340749998428160> Команды Transcript",
             value=(
                 "`.addticket [ID модератора] [ссылка] [категория]`\n> *Записать новый обработанный тикет в базу данных.*\n\n"
-                "`.ticketlogs [ID / упоминание] [страница]`\n> *Посмотреть логи тикетов модератора.*"
+                "`.ticketlogs [ID / упоминание]`\n> *Посмотреть логи тикетов модератора (с кнопками листания).*"
             ),
             inline=False,
         )
@@ -396,8 +445,8 @@ def get_ticketstats_usage_embed():
 
 def get_ticketlogs_usage_embed():
     embed = discord.Embed(color=EMBED_COLOR, title="Команда: ticketlogs", description="Посмотреть список обработанных тикетов модератора")
-    embed.add_field(name="Использование:", value="`.ticketlogs [упоминание / ID модератора] [номер страницы]`", inline=False)
-    embed.add_field(name="Примеры:", value="`.tl` — 1-я страница своих логов\n`.tl 2` — 2-я страница своих логов\n`.ticketlogs [ID] 1` — 1-я страница логов модератора", inline=False)
+    embed.add_field(name="Использование:", value="`.ticketlogs [упоминание / ID модератора]`", inline=False)
+    embed.add_field(name="Примеры:", value="`.tl` — показать свои логи\n`.ticketlogs [ID]` — показать логи выбранного модератора", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
     return embed
 
@@ -474,11 +523,18 @@ async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.Us
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="ticketlogs", description="Посмотреть тикеты пользователя")
-@app_commands.describe(staff="Участник персонала", page="Номер страницы")
+@app_commands.describe(staff="Участник персонала")
 @check_transcript_slash()
-async def slash_ticket_logs(interaction: discord.Interaction, staff: discord.User = None, page: int = 1):
-    embed = process_ticket_logs(staff or interaction.user, page)
-    await interaction.response.send_message(embed=embed)
+async def slash_ticket_logs(interaction: discord.Interaction, staff: discord.User = None):
+    target = staff or interaction.user
+    embed, total_pages = process_ticket_logs(target, 1)
+    
+    if total_pages > 1:
+        view = TicketLogsPaginationView(interaction.user.id, target, total_pages, 1)
+        await interaction.response.send_message(embed=embed, view=view)
+        view.message = await interaction.original_response()
+    else:
+        await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="leaderboard", description="Посмотреть топ модераторов по тикетам и транскриптам")
 @check_support_slash()
@@ -580,9 +636,16 @@ async def prefix_ticket_stats_error(ctx: commands.Context, error):
 
 @bot.command(name="ticketlogs", aliases=["tl", "tlogs"])
 @check_transcript_prefix()
-async def prefix_ticket_logs(ctx: commands.Context, staff: discord.User = None, page: int = 1):
-    embed = process_ticket_logs(staff or ctx.author, page)
-    await ctx.send(embed=embed)
+async def prefix_ticket_logs(ctx: commands.Context, staff: discord.User = None):
+    target = staff or ctx.author
+    embed, total_pages = process_ticket_logs(target, 1)
+
+    if total_pages > 1:
+        view = TicketLogsPaginationView(ctx.author.id, target, total_pages, 1)
+        msg = await ctx.send(embed=embed, view=view)
+        view.message = msg
+    else:
+        await ctx.send(embed=embed)
 
 @prefix_ticket_logs.error
 async def prefix_ticket_logs_error(ctx: commands.Context, error):
