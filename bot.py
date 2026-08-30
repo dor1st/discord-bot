@@ -149,6 +149,50 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     else:
         await interaction.response.send_message(msg, ephemeral=True)
 
+# ================= UI ПАГИНАЦИЯ (КНОПКИ) =================
+
+class TicketLogsView(discord.ui.View):
+    def __init__(self, target_user: discord.User, current_page: int, total_pages: int, author_id: int):
+        super().__init__(timeout=60.0)
+        self.target_user = target_user
+        self.current_page = current_page
+        self.total_pages = total_pages
+        self.author_id = author_id
+
+        self.prev_button.disabled = self.current_page <= 1
+        self.next_button.disabled = self.current_page >= self.total_pages
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("<:bruh:1521904409582375174> Вы не можете использовать эти кнопки.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.secondary, custom_id="prev_page")
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page -= 1
+        embed, _, _ = process_ticket_logs(self.target_user, self.current_page)
+        self.prev_button.disabled = self.current_page <= 1
+        self.next_button.disabled = self.current_page >= self.total_pages
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.secondary, custom_id="next_page")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page += 1
+        embed, _, _ = process_ticket_logs(self.target_user, self.current_page)
+        self.prev_button.disabled = self.current_page <= 1
+        self.next_button.disabled = self.current_page >= self.total_pages
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        try:
+            if hasattr(self, 'message') and self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
+
 # ================= БИЗНЕС-ЛОГИКА ТИКЕТОВ =================
 
 def get_monthly_tickets(staff_id: int) -> int:
@@ -187,7 +231,7 @@ def process_ticket_logs(target_user: discord.User, page: int = 1):
             color=EMBED_COLOR,
         )
         embed.set_footer(text=f"Страница 1/1 (0 логов) • {FOOTER_TEXT}")
-        return embed
+        return embed, 1, 1
 
     items_per_page = 5
     total_logs = len(logs)
@@ -218,14 +262,13 @@ def process_ticket_logs(target_user: discord.User, page: int = 1):
 
     embed.description += "\n\n" + "\n\n".join(lines)
     embed.set_footer(text=f"Страница {current_page}/{total_pages} ({total_logs} логов) • {FOOTER_TEXT}")
-    return embed
+    return embed, current_page, total_pages
 
 def process_ticket_stats(target_user: discord.User):
     now = datetime.now()
     d7 = now - timedelta(days=7)
     d30 = now - timedelta(days=30)
 
-    # Оптимизированный единый SQL-запрос для подсчета статистики
     cursor.execute("""
         SELECT 
             SUM(CASE WHEN staff_id = ? AND created_at >= ? THEN 1 ELSE 0 END),
@@ -240,7 +283,6 @@ def process_ticket_stats(target_user: discord.User):
     
     c7_s, c30_s, call_s, c7_a, c30_a, call_a = [v or 0 for v in cursor.fetchone()]
 
-    # Последний проведенный и внесенный тикеты
     cursor.execute("SELECT created_at FROM tickets WHERE staff_id = ? ORDER BY id DESC LIMIT 1", (target_user.id,))
     l_s = cursor.fetchone()
     cursor.execute("SELECT created_at FROM tickets WHERE author_id = ? ORDER BY id DESC LIMIT 1", (target_user.id,))
@@ -476,8 +518,15 @@ async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.Us
 @app_commands.describe(staff="Участник персонала", page="Номер страницы")
 @check_transcript_slash()
 async def slash_ticket_logs(interaction: discord.Interaction, staff: discord.User = None, page: int = 1):
-    embed = process_ticket_logs(staff or interaction.user, page)
-    await interaction.response.send_message(embed=embed)
+    target_user = staff or interaction.user
+    embed, current_page, total_pages = process_ticket_logs(target_user, page)
+
+    if total_pages > 1:
+        view = TicketLogsView(target_user, current_page, total_pages, interaction.user.id)
+        await interaction.response.send_message(embed=embed, view=view)
+        view.message = await interaction.original_response()
+    else:
+        await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="leaderboard", description="Посмотреть топ модераторов по тикетам и транскриптам")
 @check_support_slash()
@@ -579,9 +628,40 @@ async def prefix_ticket_stats_error(ctx: commands.Context, error):
 
 @bot.command(name="ticketlogs", aliases=["tl", "tlogs"])
 @check_transcript_prefix()
-async def prefix_ticket_logs(ctx: commands.Context, staff: discord.User = None, page: int = 1):
-    embed = process_ticket_logs(staff or ctx.author, page)
-    await ctx.send(embed=embed)
+async def prefix_ticket_logs(ctx: commands.Context, *, args: str = None):
+    target_user = ctx.author
+    page = 1
+
+    if args:
+        parts = args.split()
+        first_arg = parts[0]
+
+        if first_arg.isdigit() and len(first_arg) <= 5:
+            page = int(first_arg)
+        else:
+            clean_id = first_arg.strip("<@!>")
+            if clean_id.isdigit():
+                user_id = int(clean_id)
+                try:
+                    target_user = await bot.fetch_user(user_id)
+                except (discord.NotFound, discord.HTTPException):
+                    await ctx.send(f"<:bruh:1521904409582375174> Пользователь с ID `{user_id}` не найден.")
+                    return
+            else:
+                await ctx.send(embed=get_ticketlogs_usage_embed())
+                return
+
+            if len(parts) > 1 and parts[1].isdigit():
+                page = int(parts[1])
+
+    embed, current_page, total_pages = process_ticket_logs(target_user, page)
+
+    if total_pages > 1:
+        view = TicketLogsView(target_user, current_page, total_pages, ctx.author.id)
+        msg = await ctx.send(embed=embed, view=view)
+        view.message = msg
+    else:
+        await ctx.send(embed=embed)
 
 @prefix_ticket_logs.error
 async def prefix_ticket_logs_error(ctx: commands.Context, error):
