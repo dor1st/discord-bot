@@ -51,7 +51,7 @@ def get_next_sequence_value(sequence_name: str) -> int:
 
 # ================= ВЛАДЕЛЕЦ БОТА =================
 # Укажи сюда свой Discord ID. Команда .config / /config доступна только этому пользователю.
-OWNER_ID = 000000000000000000  # TODO: укажите ваш Discord ID
+OWNER_ID = 851443344718430210 
 
 # ================= ТАБЛИЦА ЛОГИРУЕМЫХ КОМАНД (значения по умолчанию) =================
 # True  — действие этой команды будет отправляться в канал логов
@@ -89,7 +89,7 @@ def load_config():
         "_id": "config",
         "embed_color": 0x212121,
         "footer_text": "ТУСОВКА ДОРИСТА",
-        "log_channel_id": None,
+        "log_channel_id": 1543903998677876836,
         "log_toggles": dict(LOGGABLE_COMMANDS_DEFAULT),
     }
 
