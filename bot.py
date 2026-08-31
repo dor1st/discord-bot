@@ -27,12 +27,16 @@ except Exception as e:
 
 db = mongo_client["discord_tickets_db"]
 
-# Коллекция для хранения тикетов и автоинкремент счетчика
+# Коллекции: тикеты, счётчики автоинкремента, удалённые тикеты и настройки бота
 tickets_col = db["tickets"]
 counters_col = db["counters"]
+deleted_tickets_col = db["deleted_tickets"]
+settings_col = db["settings"]
 
-# Индекс для предотвращения дублирования транскриптов
+# Индексы для предотвращения дублирования транскриптов
 tickets_col.create_index("transcript_url", unique=True, sparse=True)
+deleted_tickets_col.create_index("transcript_url", unique=True, sparse=True)
+
 
 def get_next_sequence_value(sequence_name: str) -> int:
     """Генерирует автоинкрементный ID (аналог AUTOINCREMENT в SQLite)."""
@@ -44,20 +48,97 @@ def get_next_sequence_value(sequence_name: str) -> int:
     )
     return seq["sequence_value"]
 
+
+# ================= ВЛАДЕЛЕЦ БОТА =================
+# Укажи сюда свой Discord ID. Команда .config / /config доступна только этому пользователю.
+OWNER_ID = 000000000000000000  # TODO: укажите ваш Discord ID
+
+# ================= ТАБЛИЦА ЛОГИРУЕМЫХ КОМАНД (значения по умолчанию) =================
+# True  — действие этой команды будет отправляться в канал логов
+# False — действие этой команды логироваться не будет
+# Значения по умолчанию используются только при первом запуске бота — далее всё
+# хранится в базе данных и меняется через .config / /config.
+LOGGABLE_COMMANDS_DEFAULT = {
+    "addticket": True,      # Добавление тикета/транскрипта в базу
+    "deleteticket": True,   # Удаление тикета (канала) + запись в базу
+    "deletelog": True,      # Удаление конкретного лога из базы
+    "resetlogs": True,      # Полный сброс логов пользователя
+    "ticketlogs": False,    # Просмотр логов модератора
+    "ticketstats": False,   # Просмотр статистики
+    "leaderboard": False,   # Просмотр лидерборда
+    "help": False,          # Использование меню помощи
+    "config": True,         # Изменения в настройках бота
+}
+
+# ================= НАСТРОЙКИ БОТА, ХРАНИМЫЕ В БД (цвет, footer, канал логов, тумблеры) =================
+
+CONFIG = {}
+
+
+def apply_config_globals():
+    """Обновляет глобальные переменные EMBED_COLOR / FOOTER_TEXT из текущего CONFIG."""
+    global EMBED_COLOR, FOOTER_TEXT
+    EMBED_COLOR = discord.Color(CONFIG["embed_color"])
+    FOOTER_TEXT = CONFIG["footer_text"]
+
+
+def load_config():
+    """Загружает настройки из БД при старте бота, создавая их при первом запуске."""
+    global CONFIG
+    defaults = {
+        "_id": "config",
+        "embed_color": 0x212121,
+        "footer_text": "ТУСОВКА ДОРИСТА",
+        "log_channel_id": None,
+        "log_toggles": dict(LOGGABLE_COMMANDS_DEFAULT),
+    }
+
+    doc = settings_col.find_one({"_id": "config"})
+    if doc is None:
+        settings_col.insert_one(defaults)
+        doc = defaults
+    else:
+        updated = False
+        toggles = doc.get("log_toggles", {})
+        for cmd, default_value in LOGGABLE_COMMANDS_DEFAULT.items():
+            if cmd not in toggles:
+                toggles[cmd] = default_value
+                updated = True
+        doc["log_toggles"] = toggles
+        for key, value in defaults.items():
+            if key not in doc:
+                doc[key] = value
+                updated = True
+        if updated:
+            settings_col.update_one({"_id": "config"}, {"$set": doc}, upsert=True)
+
+    CONFIG = doc
+    apply_config_globals()
+
+
+def update_config(patch: dict):
+    """Обновляет настройки бота и в БД, и в кэше памяти."""
+    global CONFIG
+    settings_col.update_one({"_id": "config"}, {"$set": patch}, upsert=True)
+    CONFIG.update(patch)
+    apply_config_globals()
+
+
+load_config()
+
+FOOTER_TEXT_DEFAULT_NAME = "ТУСОВКА ДОРИСТА"  # оставлено для справки, реальный текст берётся из CONFIG
+
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
-
-EMBED_COLOR = discord.Color(0x212121)
-FOOTER_TEXT = "ТУСОВКА ДОРИСТА"
 
 # Количество логов на одной странице пагинации
 LOGS_PER_PAGE = 3
 
 # ================= НАСТРОЙКА РОЛЕЙ И КАНАЛОВ =================
 
-ALLOWED_CHANNEL_IDS = [1466886479396737024]
+ALLOWED_CHANNEL_IDS = [1322968592202993746, 1537220150267220018]
 
 SUPPORT_ROLE_IDS = [1501507449860001853, 1322962344040464424]
 TRANSCRIPT_ROLE_IDS = [1542601770461569044, 1323348388762226759]
@@ -77,6 +158,9 @@ def has_role_access(user: discord.Member | discord.User, role_ids: list[int]) ->
 def is_admin_user(user: discord.Member | discord.User) -> bool:
     return has_role_access(user, ADMIN_ROLE_IDS)
 
+def is_owner_user(user: discord.Member | discord.User) -> bool:
+    return user.id == OWNER_ID
+
 def check_access(user: discord.Member | discord.User, channel_id: int, role_ids: list[int]) -> tuple[bool, str]:
     if not isinstance(user, discord.Member):
         return False, "Команды работают только на сервере."
@@ -94,12 +178,14 @@ def check_access(user: discord.Member | discord.User, channel_id: int, role_ids:
     return True, ""
 
 def get_user_group_name(user: discord.Member | discord.User, channel_id: int) -> str:
+    if is_owner_user(user):
+        return "Владелец"
     if is_admin_user(user):
         return "Администрация"
     if has_role_access(user, TRANSCRIPT_ROLE_IDS):
-        return "Transcript"
+        return "Транскрипты"
     if has_role_access(user, SUPPORT_ROLE_IDS):
-        return "Support"
+        return "Поддержка"
     return "Пользователь"
 
 def check_access_decorator(role_ids: list[int], is_slash: bool = False):
@@ -123,13 +209,44 @@ def check_admin_slash(): return check_access_decorator(ADMIN_ROLE_IDS, is_slash=
 def is_valid_addticket(transcript_url: str, category: str) -> bool:
     return "https://discord.com/" in transcript_url and category in VALID_CATEGORIES
 
+def is_valid_transcript_link(transcript_url: str) -> bool:
+    return "https://discord.com/" in transcript_url
+
 def is_transcript_exists(transcript_url: str) -> bool:
     return tickets_col.find_one({"transcript_url": transcript_url}) is not None
+
+def is_deleted_transcript_exists(transcript_url: str) -> bool:
+    return deleted_tickets_col.find_one({"transcript_url": transcript_url}) is not None
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print(f"Bot logged in as {bot.user}")
+
+# ================= ЛОГИРОВАНИЕ ДЕЙСТВИЙ В КАНАЛ ЛОГОВ =================
+
+def build_log_embed(title: str, lines: list[str]) -> discord.Embed:
+    embed = discord.Embed(title=title, description="\n".join(lines), color=EMBED_COLOR, timestamp=datetime.now(timezone.utc))
+    embed.set_footer(text=FOOTER_TEXT)
+    return embed
+
+async def send_log(command_name: str, embed: discord.Embed):
+    """Отправляет embed в канал логов, если для этой команды логирование включено."""
+    if not CONFIG.get("log_toggles", {}).get(command_name, False):
+        return
+    channel_id = CONFIG.get("log_channel_id")
+    if not channel_id:
+        return
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return
+    try:
+        await channel.send(embed=embed)
+    except Exception:
+        pass
 
 # ================= ОБРАБОТКА ОШИБОК =================
 
@@ -177,16 +294,16 @@ def process_add_ticket(author_user: discord.User, staff_user: discord.User, tran
     monthly_count = get_monthly_tickets(staff_user.id)
     discord_timestamp = f"<t:{int(now.timestamp())}:F>"
 
-    # Внесено изменение 1: Заголовок теперь включает номер лога
-    embed = discord.Embed(title=f"<:logs:1522340749998428160> Лог №{ticket_id} — {staff_user.display_name}", color=EMBED_COLOR)
+    embed = discord.Embed(title=f"<:logs:1522340749998428160> Лог тикета — {staff_user.display_name}", color=EMBED_COLOR)
     embed.add_field(name="Дата транскрипта", value=discord_timestamp, inline=False)
+    embed.add_field(name="Номер лога", value=f"№{ticket_id}", inline=False)
     embed.add_field(name="Ссылка на транскрипт", value=transcript_url, inline=False)
     embed.add_field(name="Кто вёл тикет", value=str(staff_user.id), inline=False)
     embed.add_field(name="Внёс в базу", value=author_user.mention, inline=False)
     embed.add_field(name="Тикетов за последний месяц", value=str(monthly_count), inline=False)
     embed.add_field(name="Категория", value=category, inline=False)
     embed.set_footer(text=FOOTER_TEXT)
-    return embed
+    return embed, ticket_id
 
 def process_ticket_logs(target_user: discord.User, page: int = 1) -> tuple[discord.Embed, int]:
     logs = list(tickets_col.find({"staff_id": target_user.id}).sort("_id", ASCENDING))
@@ -238,7 +355,7 @@ def process_ticket_logs(target_user: discord.User, page: int = 1) -> tuple[disco
 
 class TicketLogsPaginationView(discord.ui.View):
     def __init__(self, author_id: int, target_user: discord.User, total_pages: int, initial_page: int = 1):
-        super().__init__(timeout=120)
+        super().__init__(timeout=120)  # Таймаут активности кнопок — 2 минуты
         self.author_id = author_id
         self.target_user = target_user
         self.total_pages = total_pages
@@ -296,6 +413,10 @@ def process_ticket_stats(target_user: discord.User):
     c30_a = tickets_col.count_documents({"author_id": target_user.id, "created_at": {"$gte": d30}})
     call_a = tickets_col.count_documents({"author_id": target_user.id})
 
+    c7_d = deleted_tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": d7}})
+    c30_d = deleted_tickets_col.count_documents({"staff_id": target_user.id, "created_at": {"$gte": d30}})
+    call_d = deleted_tickets_col.count_documents({"staff_id": target_user.id})
+
     l_s_doc = tickets_col.find_one({"staff_id": target_user.id}, sort=[("_id", DESCENDING)])
     l_a_doc = tickets_col.find_one({"author_id": target_user.id}, sort=[("_id", DESCENDING)])
 
@@ -310,9 +431,9 @@ def process_ticket_stats(target_user: discord.User):
     embed = discord.Embed(color=EMBED_COLOR)
     embed.set_author(name=target_user.name, icon_url=target_user.display_avatar.url)
     embed.title = "<:ticket:1522343287816716379> Статистика тикетов и транскриптов"
-    embed.add_field(name="За последние 7 дней:", value=f"• Тикетов: **{c7_s}**\n• Транскриптов: **{c7_a}**", inline=True)
-    embed.add_field(name="За последние 30 дней:", value=f"• Тикетов: **{c30_s}**\n• Транскриптов: **{c30_a}**", inline=True)
-    embed.add_field(name="За всё время:", value=f"• Тикетов: **{call_s}**\n• Транскриптов: **{call_a}**", inline=True)
+    embed.add_field(name="За последние 7 дней:", value=f"• Тикетов: **{c7_s}**\n• Транскриптов: **{c7_a}**\n• Удалено тикетов: **{c7_d}**", inline=True)
+    embed.add_field(name="За последние 30 дней:", value=f"• Тикетов: **{c30_s}**\n• Транскриптов: **{c30_a}**\n• Удалено тикетов: **{c30_d}**", inline=True)
+    embed.add_field(name="За всё время:", value=f"• Тикетов: **{call_s}**\n• Транскриптов: **{call_a}**\n• Удалено тикетов: **{call_d}**", inline=True)
     embed.add_field(
         name="<:lighting:1522337543360872489> Активность:",
         value=f"• **Последний проведённый тикет:** {fmt_last(l_s_doc)}\n• **Последний внесённый транскрипт:** {fmt_last(l_a_doc)}",
@@ -326,8 +447,7 @@ def process_leaderboard():
     d7 = now - timedelta(days=7)
     d30 = now - timedelta(days=30)
 
-    # Внесено изменение 2: ограничение выборки до ТОП 3
-    def get_top(field: str, min_date=None, exclude_zero=False):
+    def get_top(collection, field: str, min_date=None, exclude_zero=False):
         match_stage = {}
         if min_date:
             match_stage["created_at"] = {"$gte": min_date}
@@ -341,54 +461,104 @@ def process_leaderboard():
         pipeline.extend([
             {"$group": {"_id": f"${field}", "cnt": {"$sum": 1}}},
             {"$sort": {"cnt": -1}},
-            {"$limit": 3}
+            {"$limit": 5}
         ])
 
-        results = list(tickets_col.aggregate(pipeline))
+        results = list(collection.aggregate(pipeline))
         return [(doc["_id"], doc["cnt"]) for doc in results]
 
-    # Внесено изменение 2: Вывод строго 3 мест с прочерками (—) на отсутствующих
     def format_top(top_list, unit_label="тикетов"):
-        lines = []
-        for i in range(1, 4):
-            if i <= len(top_list):
-                u_id, count = top_list[i - 1]
-                lines.append(f"`{i}.` <@{u_id}> — **{count}** {unit_label}")
-            else:
-                lines.append(f"`{i}.` —")
-        return "\n".join(lines)
+        if not top_list:
+            return "— *Нет данных*"
+        return "\n".join([f"`{idx}.` <@{u_id}> — **{count}** {unit_label}" for idx, (u_id, count) in enumerate(top_list, 1)])
 
-    embed = discord.Embed(title="<:ticket:1522343287816716379> Лидерборд тикетов и транскриптов", color=EMBED_COLOR)
+    embed = discord.Embed(title="<:sparkles:1522342290494849034> Лидерборд тикетов и транскриптов", color=EMBED_COLOR)
 
-    embed.add_field(name="<:ticket:1522343287816716379> Проведено тикетов (7 дн.)", value=format_top(get_top("staff_id", d7)), inline=True)
-    embed.add_field(name="<:logs:1522340749998428160> Внесёно транскриптов (7 дн.)", value=format_top(get_top("author_id", d7, True), "транскриптов"), inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (7 дн.)", value=format_top(get_top(tickets_col, "staff_id", d7)), inline=True)
+    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (7 дн.)", value=format_top(get_top(tickets_col, "author_id", d7, True), "транскриптов"), inline=True)
+    embed.add_field(name="🗑️ Удалено тикетов (7 дн.)", value=format_top(get_top(deleted_tickets_col, "staff_id", d7), "удалений"), inline=True)
 
-    embed.add_field(name="<:ticket:1522343287816716379> Проведено тикетов (30 дн.)", value=format_top(get_top("staff_id", d30)), inline=True)
-    embed.add_field(name="<:logs:1522340749998428160> Внесёно транскриптов (30 дн.)", value=format_top(get_top("author_id", d30, True), "транскриптов"), inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (30 дн.)", value=format_top(get_top(tickets_col, "staff_id", d30)), inline=True)
+    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (30 дн.)", value=format_top(get_top(tickets_col, "author_id", d30, True), "транскриптов"), inline=True)
+    embed.add_field(name="🗑️ Удалено тикетов (30 дн.)", value=format_top(get_top(deleted_tickets_col, "staff_id", d30), "удалений"), inline=True)
 
-    embed.add_field(name="<:ticket:1522343287816716379> Проведено тикетов (Все время)", value=format_top(get_top("staff_id")), inline=True)
-    embed.add_field(name="<:logs:1522340749998428160> Внесёно транскриптов (Все время)", value=format_top(get_top("author_id", exclude_zero=True), "транскриптов"), inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (Все время)", value=format_top(get_top(tickets_col, "staff_id")), inline=True)
+    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (Все время)", value=format_top(get_top(tickets_col, "author_id", exclude_zero=True), "транскриптов"), inline=True)
+    embed.add_field(name="🗑️ Удалено тикетов (Все время)", value=format_top(get_top(deleted_tickets_col, "staff_id"), "удалений"), inline=True)
 
     embed.set_footer(text=f"Сегодня в {now.strftime('%H:%M')} • {FOOTER_TEXT}")
     return embed
 
-def delete_ticket(log_id: int):
+def delete_ticket_log(log_id: int):
+    """Удаляет одну запись лога тикета из базы (команда .deletelog)."""
     return tickets_col.find_one_and_delete({"_id": log_id})
 
 def reset_tickets(staff_id: int) -> int:
-    res = tickets_col.delete_many({"$or": [{"staff_id": staff_id}, {"author_id": staff_id}]})
-    return res.deleted_count
+    """Полностью очищает все логи (тикеты, транскрипты, удаления) конкретного пользователя."""
+    res1 = tickets_col.delete_many({"$or": [{"staff_id": staff_id}, {"author_id": staff_id}]})
+    res2 = deleted_tickets_col.delete_many({"$or": [{"staff_id": staff_id}, {"deleted_by": staff_id}]})
+    return res1.deleted_count + res2.deleted_count
+
+def process_delete_ticket_channel(author_user: discord.User, log_id: int, transcript_url: str):
+    """
+    Записывает факт удаления тикета (канала) в базу и добавляет +1 к счётчику
+    удалённых тикетов того модератора, который изначально вёл тикет №log_id.
+    Возвращает (embed, error_code). error_code: None | "not_found" | "duplicate".
+    """
+    original = tickets_col.find_one({"_id": log_id})
+    if not original:
+        return None, "not_found"
+
+    if is_deleted_transcript_exists(transcript_url):
+        return None, "duplicate"
+
+    staff_id = original["staff_id"]
+    deleted_id = get_next_sequence_value("deleted_ticket_id")
+    now = datetime.now(timezone.utc)
+
+    deleted_tickets_col.insert_one({
+        "_id": deleted_id,
+        "original_log_id": log_id,
+        "staff_id": staff_id,
+        "deleted_by": author_user.id,
+        "transcript_url": transcript_url,
+        "created_at": now,
+    })
+
+    monthly_count = deleted_tickets_col.count_documents({
+        "staff_id": staff_id,
+        "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(days=30)}
+    })
+    discord_timestamp = f"<t:{int(now.timestamp())}:F>"
+
+    embed = discord.Embed(title="🗑️ Удалён тикет", color=EMBED_COLOR)
+    embed.add_field(name="Дата удаления", value=discord_timestamp, inline=False)
+    embed.add_field(name="Номер лога тикета", value=f"№{log_id}", inline=False)
+    embed.add_field(name="Ссылка на транскрипт удаления", value=transcript_url, inline=False)
+    embed.add_field(name="Ответственный модератор", value=f"<@{staff_id}>", inline=False)
+    embed.add_field(name="Внёс в базу", value=author_user.mention, inline=False)
+    embed.add_field(name="Удалённых тикетов за последний месяц", value=str(monthly_count), inline=False)
+    embed.set_footer(text=FOOTER_TEXT)
+    return embed, None
 
 # ================= EMBEDS ПОМОЩИ =================
+
+def get_help_categories_embed(user: discord.Member | discord.User, channel_id: int):
+    group_name = get_user_group_name(user, channel_id)
+    embed = discord.Embed(
+        title="<:staff:1522338131339251823> Меню команд бота",
+        description="Выберите категорию команд ниже.\nВ будущем здесь появится больше категорий.",
+        color=EMBED_COLOR,
+    )
+    embed.add_field(name="🎫 Тикеты", value="Команды для работы с тикетами и транскриптами.", inline=False)
+    embed.set_footer(text=f"Ваша текущая группа: {group_name} • {FOOTER_TEXT}")
+    return embed
 
 def get_help_embed(user: discord.Member | discord.User, channel_id: int):
     group_name = get_user_group_name(user, channel_id)
 
     embed = discord.Embed(
-        title="<:staff:1522338131339251823> Список команд бота",
+        title="<:ticket:1522343287816716379> Категория: Тикеты",
         description="Используй префикс `.` или слэш-команды `/`",
         color=EMBED_COLOR,
     )
@@ -397,9 +567,9 @@ def get_help_embed(user: discord.Member | discord.User, channel_id: int):
         embed.add_field(
             name="<:ticket:1522343287816716379> Команды Support",
             value=(
-                "`.help` — Показать это меню с командами.\n\n"
-                "`.ticketstats [ID / упоминание]`\n> *Посмотреть статистику тикетов и транскриптов.*\n\n"
-                "`.leaderboard`\n> *Посмотреть топ модераторов по тикетам и транскриптам.*"
+                "`.help` — Показать меню команд.\n\n"
+                "`.ticketstats [ID / упоминание]`\n> *Посмотреть статистику тикетов, транскриптов и удалений.*\n\n"
+                "`.leaderboard`\n> *Посмотреть топ модераторов по тикетам, транскриптам и удалениям.*"
             ),
             inline=False,
         )
@@ -409,7 +579,8 @@ def get_help_embed(user: discord.Member | discord.User, channel_id: int):
             name="<:logs:1522340749998428160> Команды Transcript",
             value=(
                 "`.addticket [ID модератора] [ссылка] [категория]`\n> *Записать новый обработанный тикет в базу данных.*\n\n"
-                "`.ticketlogs [ID / упоминание]`\n> *Посмотреть логи тикетов модератора (с кнопками листания).*"
+                "`.ticketlogs [ID / упоминание]`\n> *Посмотреть логи тикетов модератора (с кнопками листания).*\n\n"
+                "`.deleteticket [номер лога] [ссылка на транскрипт]`\n> *Записать удаление тикета (канала) и добавить +1 удалённый тикет модератору.*"
             ),
             inline=False,
         )
@@ -418,9 +589,16 @@ def get_help_embed(user: discord.Member | discord.User, channel_id: int):
         embed.add_field(
             name="<:mod:1522343179205087363> Команды Администрации",
             value=(
-                "`.deleteticket [ID лога]`\n> *Удалить конкретный тикет по ID лога.*\n\n"
-                "`.resettickets [ID / упоминание]`\n> *Очистить абсолютно все логи модератора.*"
+                "`.deletelog [ID лога]`\n> *Удалить конкретный лог тикета по ID.*\n\n"
+                "`.resetlogs [ID / упоминание]`\n> *Очистить абсолютно все логи модератора (тикеты, транскрипты, удаления).*"
             ),
+            inline=False,
+        )
+
+    if is_owner_user(user):
+        embed.add_field(
+            name="⚙️ Команды Владельца",
+            value="`.config`\n> *Открыть меню настроек бота (цвет, footer, канал логов, логируемые команды).*",
             inline=False,
         )
 
@@ -447,7 +625,7 @@ def get_addticket_usage_embed():
     return embed
 
 def get_ticketstats_usage_embed():
-    embed = discord.Embed(color=EMBED_COLOR, title="Команда: ticketstats", description="Посмотреть статистику тикетов и транскриптов модератора")
+    embed = discord.Embed(color=EMBED_COLOR, title="Команда: ticketstats", description="Посмотреть статистику тикетов, транскриптов и удалений модератора")
     embed.add_field(name="Использование:", value="`.ticketstats [упоминание / ID модератора]`", inline=False)
     embed.add_field(name="Примеры:", value="`.ts` — показать свою статистику\n`.ticketstats [ID модератора]` — показать статистику выбранного модератора", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
@@ -461,26 +639,262 @@ def get_ticketlogs_usage_embed():
     return embed
 
 def get_deleteticket_usage_embed():
-    embed = discord.Embed(color=EMBED_COLOR, title="Команда: deleteticket 🔒", description="Удалить один тикет из базы данных (Только Администрация)")
-    embed.add_field(name="Использование:", value="`.deleteticket [номер лога]`", inline=False)
-    embed.add_field(name="Пример:", value="`.dt 15` — удалить лог под номером 15", inline=False)
+    embed = discord.Embed(color=EMBED_COLOR, title="Команда: deleteticket", description="Записать удаление тикета (канала) в базу данных")
+    embed.add_field(
+        name="Правила аргументов:",
+        value=(
+            "1. Номер лога — это номер, который бот показал при `.addticket` (поле «Номер лога»)\n"
+            "2. Ссылка должна содержать: `https://discord.com/`\n"
+            "3. Один и тот же транскрипт удаления нельзя внести дважды\n"
+            "4. Модератору, который изначально вёл этот тикет, добавляется +1 удалённый тикет"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="Использование:", value="`.deleteticket [номер лога] [ссылка на транскрипт]`", inline=False)
+    embed.add_field(name="Пример:", value="`.deleteticket 42 https://discord.com/channels/...`", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
     return embed
 
-def get_resettickets_usage_embed():
-    embed = discord.Embed(color=EMBED_COLOR, title="Команда: resettickets (алиасы: .rt) 🔒", description="Полностью очистить логи пользователя (Только Администрация)")
-    embed.add_field(name="Использование:", value="`.resettickets [упоминание / ID пользователя]`", inline=False)
-    embed.add_field(name="Пример:", value="`.resettickets [ID модератора]` — сбросить тикеты указанного модератора", inline=False)
+def get_deletelog_usage_embed():
+    embed = discord.Embed(color=EMBED_COLOR, title="Команда: deletelog 🔒", description="Удалить один лог тикета из базы данных (Только Администрация)")
+    embed.add_field(name="Использование:", value="`.deletelog [номер лога]`", inline=False)
+    embed.add_field(name="Пример:", value="`.del 15` — удалить лог под номером 15", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
     return embed
+
+def get_resetlogs_usage_embed():
+    embed = discord.Embed(color=EMBED_COLOR, title="Команда: resetlogs (алиасы: .rt) 🔒", description="Полностью очистить логи пользователя (Только Администрация)")
+    embed.add_field(name="Использование:", value="`.resetlogs [упоминание / ID пользователя]`", inline=False)
+    embed.add_field(name="Пример:", value="`.resetlogs [ID модератора]` — сбросить все логи указанного модератора", inline=False)
+    embed.set_footer(text=FOOTER_TEXT)
+    return embed
+
+# ================= МЕНЮ ПОМОЩИ С КАТЕГОРИЯМИ (КНОПКИ) =================
+
+class TicketHelpView(discord.ui.View):
+    """Показывается после нажатия на категорию «Тикеты». Содержит кнопку «Назад»."""
+    def __init__(self, author_id: int, channel_id: int):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.channel_id = channel_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "<:bruh:1521904409582375174> Это меню вызвали не вы.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = get_help_categories_embed(interaction.user, self.channel_id)
+        view = HelpCategoriesView(self.author_id, self.channel_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+class HelpCategoriesView(discord.ui.View):
+    """Стартовое меню помощи со списком категорий. Пока только «Тикеты» — новые
+    категории добавляются простым добавлением новой @discord.ui.button ниже."""
+    def __init__(self, author_id: int, channel_id: int):
+        super().__init__(timeout=120)
+        self.author_id = author_id
+        self.channel_id = channel_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "<:bruh:1521904409582375174> Это меню вызвали не вы.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Тикеты", emoji="🎫", style=discord.ButtonStyle.primary)
+    async def tickets_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = get_help_embed(interaction.user, self.channel_id)
+        view = TicketHelpView(self.author_id, self.channel_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+# ================= МЕНЮ НАСТРОЕК БОТА (.config) =================
+
+def get_config_embed():
+    channel_id = CONFIG.get("log_channel_id")
+    channel_mention = f"<#{channel_id}>" if channel_id else "Не установлен"
+
+    toggles_lines = []
+    for cmd in LOGGABLE_COMMANDS_DEFAULT:
+        state = "✅" if CONFIG.get("log_toggles", {}).get(cmd, False) else "❌"
+        toggles_lines.append(f"{state} `{cmd}`")
+
+    embed = discord.Embed(
+        title="⚙️ Настройки бота",
+        description="Меню настроек доступно только владельцу бота. Выберите пункт в списке ниже.",
+        color=EMBED_COLOR,
+    )
+    embed.add_field(name="Цвет embed", value=f"`#{CONFIG['embed_color']:06X}`", inline=True)
+    embed.add_field(name="Footer текст", value=CONFIG["footer_text"], inline=True)
+    embed.add_field(name="Канал логов", value=channel_mention, inline=True)
+    embed.add_field(name="Команды для логов", value="\n".join(toggles_lines), inline=False)
+    embed.set_footer(text=FOOTER_TEXT)
+    return embed
+
+class ColorModal(discord.ui.Modal, title="Изменить цвет embed"):
+    color_input = discord.ui.TextInput(label="HEX цвет без #, например 212121", placeholder="212121", min_length=6, max_length=6)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.color_input.value.strip().lstrip("#")
+        try:
+            value = int(raw, 16)
+            if not (0 <= value <= 0xFFFFFF):
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message(f"<:bruh:1521904409582375174> Некорректный HEX цвет: `{raw}`", ephemeral=True)
+            return
+        update_config({"embed_color": value})
+        await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Цвет embed изменён на `#{raw.upper()}`.", ephemeral=True)
+        await send_log("config", build_log_embed("⚙️ Изменена настройка бота", [
+            f"**Кто изменил:** {interaction.user.mention}",
+            "**Что изменено:** Цвет embed",
+            f"**Новое значение:** `#{raw.upper()}`",
+        ]))
+
+class FooterModal(discord.ui.Modal, title="Изменить footer текст"):
+    footer_input = discord.ui.TextInput(label="Новый текст footer", placeholder="ТУСОВКА ДОРИСТА", max_length=100)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        update_config({"footer_text": self.footer_input.value})
+        await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Footer текст изменён на: `{self.footer_input.value}`.", ephemeral=True)
+        await send_log("config", build_log_embed("⚙️ Изменена настройка бота", [
+            f"**Кто изменил:** {interaction.user.mention}",
+            "**Что изменено:** Footer текст",
+            f"**Новое значение:** {self.footer_input.value}",
+        ]))
+
+class LogChannelView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(cls=discord.ui.ChannelSelect, placeholder="Выберите канал для логов...", channel_types=[discord.ChannelType.text])
+    async def channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        channel = select.values[0]
+        update_config({"log_channel_id": channel.id})
+        embed = get_config_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+        await send_log("config", build_log_embed("⚙️ Изменена настройка бота", [
+            f"**Кто изменил:** {interaction.user.mention}",
+            "**Что изменено:** Канал логов",
+            f"**Новое значение:** {channel.mention}",
+        ]))
+
+    @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = get_config_embed()
+        view = ConfigMainView(self.owner_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class LogTogglesSelect(discord.ui.Select):
+    def __init__(self):
+        options = []
+        for cmd, default_value in LOGGABLE_COMMANDS_DEFAULT.items():
+            enabled = CONFIG.get("log_toggles", {}).get(cmd, default_value)
+            options.append(discord.SelectOption(label=cmd, value=cmd, default=enabled))
+        super().__init__(
+            placeholder="Отметьте команды, которые нужно логировать...",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        enabled_set = set(self.values)
+        new_toggles = {cmd: (cmd in enabled_set) for cmd in LOGGABLE_COMMANDS_DEFAULT}
+        update_config({"log_toggles": new_toggles})
+        embed = get_config_embed()
+        view = LogTogglesView(interaction.user.id)
+        await interaction.response.edit_message(embed=embed, view=view)
+        await send_log("config", build_log_embed("⚙️ Изменена настройка бота", [
+            f"**Кто изменил:** {interaction.user.mention}",
+            "**Что изменено:** Список логируемых команд",
+        ]))
+
+class LogTogglesView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.add_item(LogTogglesSelect())
+        back = discord.ui.Button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self.back_callback
+        self.add_item(back)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.", ephemeral=True)
+            return False
+        return True
+
+    async def back_callback(self, interaction: discord.Interaction):
+        embed = get_config_embed()
+        view = ConfigMainView(self.owner_id)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+class ConfigMainView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.select(
+        placeholder="Выберите, что настроить...",
+        options=[
+            discord.SelectOption(label="Цвет embed", value="color", emoji="🎨", description="Изменить цвет всех embed-сообщений бота"),
+            discord.SelectOption(label="Footer текст", value="footer", emoji="📝", description="Изменить текст в footer всех embed-сообщений"),
+            discord.SelectOption(label="Канал логов", value="log_channel", emoji="📨", description="Куда бот будет отправлять логи действий"),
+            discord.SelectOption(label="Команды для логов", value="log_toggles", emoji="🧾", description="Выбрать, какие команды логировать"),
+        ],
+    )
+    async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
+        value = select.values[0]
+        if value == "color":
+            await interaction.response.send_modal(ColorModal())
+        elif value == "footer":
+            await interaction.response.send_modal(FooterModal())
+        elif value == "log_channel":
+            embed = get_config_embed()
+            view = LogChannelView(self.owner_id)
+            await interaction.response.edit_message(embed=embed, view=view)
+        elif value == "log_toggles":
+            embed = get_config_embed()
+            view = LogTogglesView(self.owner_id)
+            await interaction.response.edit_message(embed=embed, view=view)
 
 # ================= СЛЭШ КОМАНДЫ =================
 
 @bot.tree.command(name="help", description="Показать полный список команд бота")
 @check_support_slash()
 async def slash_help(interaction: discord.Interaction):
-    embed = get_help_embed(interaction.user, interaction.channel_id)
-    await interaction.response.send_message(embed=embed)
+    embed = get_help_categories_embed(interaction.user, interaction.channel_id)
+    view = HelpCategoriesView(interaction.user.id, interaction.channel_id)
+    await interaction.response.send_message(embed=embed, view=view)
+    await send_log("help", build_log_embed("📖 Использовано меню помощи", [f"**Кто:** {interaction.user.mention}"]))
 
 @bot.tree.command(name="addticket", description="Записать новый обработанный тикет")
 @app_commands.describe(staff="ID участника персонала", transcript="Ссылка на транскрипт", category="Категория тикета")
@@ -488,14 +902,8 @@ async def slash_help(interaction: discord.Interaction):
 @check_transcript_slash()
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
 async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcript: str, category: str):
-    # Внесено изменение 3: Точечный отклик текстом при ошибочных аргументах
-    if "https://discord.com/" not in transcript:
-        await interaction.response.send_message("<:bruh:1521904409582375174> Некорректная ссылка на транскрипт. Она должна содержать `https://discord.com/`.", ephemeral=True)
-        return
-
-    if category not in VALID_CATEGORIES:
-        cats = ", ".join([f"`{c}`" for c in VALID_CATEGORIES])
-        await interaction.response.send_message(f"<:bruh:1521904409582375174> Указана недопустимая категория! Разрешенные: {cats}", ephemeral=True)
+    if not is_valid_addticket(transcript, category):
+        await interaction.response.send_message(embed=get_addticket_usage_embed(), ephemeral=True)
         return
 
     try:
@@ -518,11 +926,52 @@ async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcr
         await interaction.response.send_message(f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff}`.", ephemeral=True)
         return
 
-    embed = process_add_ticket(interaction.user, staff_user, transcript, category)
+    embed, ticket_id = process_add_ticket(interaction.user, staff_user, transcript, category)
     await interaction.response.send_message(embed=embed)
+    await send_log("addticket", build_log_embed("📥 Добавлен тикет", [
+        f"**Номер лога:** №{ticket_id}",
+        f"**Внёс:** {interaction.user.mention}",
+        f"**Модератор:** <@{staff_id}>",
+        f"**Категория:** {category}",
+        f"**Транскрипт:** {transcript}",
+    ]))
 
 @slash_add_ticket.error
 async def slash_add_ticket_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        if is_admin_user(interaction.user):
+            return
+        await interaction.response.send_message(
+            f"<:zzz:1522341702852022412> Подождите ещё {error.retry_after:.1f} сек.", ephemeral=True
+        )
+        return
+
+@bot.tree.command(name="deleteticket", description="Записать удаление тикета (канала) в базу данных")
+@app_commands.describe(log_id="Номер лога тикета (из .addticket)", transcript="Ссылка на транскрипт удаления")
+@check_transcript_slash()
+@app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
+async def slash_delete_ticket_channel(interaction: discord.Interaction, log_id: int, transcript: str):
+    if not is_valid_transcript_link(transcript):
+        await interaction.response.send_message(embed=get_deleteticket_usage_embed(), ephemeral=True)
+        return
+
+    embed, error_code = process_delete_ticket_channel(interaction.user, log_id, transcript)
+    if error_code == "not_found":
+        await interaction.response.send_message(f"<:bruh:1521904409582375174> Тикет с номером лога `{log_id}` не найден.", ephemeral=True)
+        return
+    if error_code == "duplicate":
+        await interaction.response.send_message("<:bruh:1521904409582375174> Этот транскрипт удаления уже внесён.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(embed=embed)
+    await send_log("deleteticket", build_log_embed("🗑️ Удалён тикет (канал)", [
+        f"**Номер лога:** №{log_id}",
+        f"**Внёс:** {interaction.user.mention}",
+        f"**Транскрипт удаления:** {transcript}",
+    ]))
+
+@slash_delete_ticket_channel.error
+async def slash_delete_ticket_channel_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandOnCooldown):
         if is_admin_user(interaction.user):
             return
@@ -535,8 +984,13 @@ async def slash_add_ticket_error(interaction: discord.Interaction, error: app_co
 @app_commands.describe(staff="Участник персонала")
 @check_support_slash()
 async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.User = None):
-    embed = process_ticket_stats(staff or interaction.user)
+    target = staff or interaction.user
+    embed = process_ticket_stats(target)
     await interaction.response.send_message(embed=embed)
+    await send_log("ticketstats", build_log_embed("📊 Просмотр статистики", [
+        f"**Кто смотрел:** {interaction.user.mention}",
+        f"**Чья статистика:** <@{target.id}>",
+    ]))
 
 @bot.tree.command(name="ticketlogs", description="Посмотреть тикеты пользователя")
 @app_commands.describe(staff="Участник персонала")
@@ -544,71 +998,88 @@ async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.Us
 async def slash_ticket_logs(interaction: discord.Interaction, staff: discord.User = None):
     target = staff or interaction.user
     embed, total_pages = process_ticket_logs(target, 1)
-    
+
     if total_pages > 1:
         view = TicketLogsPaginationView(interaction.user.id, target, total_pages, 1)
         await interaction.response.send_message(embed=embed, view=view)
         view.message = await interaction.original_response()
     else:
         await interaction.response.send_message(embed=embed)
+    await send_log("ticketlogs", build_log_embed("📖 Просмотр логов тикетов", [
+        f"**Кто смотрел:** {interaction.user.mention}",
+        f"**Чьи логи:** <@{target.id}>",
+    ]))
 
 @bot.tree.command(name="leaderboard", description="Посмотреть топ модераторов по тикетам и транскриптам")
 @check_support_slash()
 async def slash_leaderboard(interaction: discord.Interaction):
     embed = process_leaderboard()
     await interaction.response.send_message(embed=embed)
+    await send_log("leaderboard", build_log_embed("🏆 Просмотр лидерборда", [f"**Кто:** {interaction.user.mention}"]))
 
-@bot.tree.command(name="deleteticket", description="Удалить тикет по номеру лога (Только для Админов)")
+@bot.tree.command(name="deletelog", description="Удалить лог тикета по номеру (Только для Админов)")
 @app_commands.describe(log_id="Номер лога")
 @check_admin_slash()
-async def slash_delete_ticket(interaction: discord.Interaction, log_id: int):
-    ticket = delete_ticket(log_id)
+async def slash_delete_log(interaction: discord.Interaction, log_id: int):
+    ticket = delete_ticket_log(log_id)
     if not ticket:
         await interaction.response.send_message(f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден.", ephemeral=True)
         return
     await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
+    await send_log("deletelog", build_log_embed("❌ Удалён лог тикета", [
+        f"**Номер лога:** №{log_id}",
+        f"**Кто удалил:** {interaction.user.mention}",
+    ]))
 
-@bot.tree.command(name="resettickets", description="Удалить все логи модератора (Только для Админов)")
+@bot.tree.command(name="resetlogs", description="Удалить все логи пользователя (Только для Админов)")
 @app_commands.describe(staff="Модератор")
 @check_admin_slash()
-async def slash_reset_tickets(interaction: discord.Interaction, staff: discord.User):
+async def slash_reset_logs(interaction: discord.Interaction, staff: discord.User):
     count = reset_tickets(staff.id)
     await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`.")
+    await send_log("resetlogs", build_log_embed("♻️ Сброшены логи пользователя", [
+        f"**Пользователь:** <@{staff.id}>",
+        f"**Кто сбросил:** {interaction.user.mention}",
+        f"**Удалено записей:** {count}",
+    ]))
+
+@bot.tree.command(name="config", description="Настройки бота (только для владельца)")
+async def slash_config(interaction: discord.Interaction):
+    if not is_owner_user(interaction.user):
+        await interaction.response.send_message("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.", ephemeral=True)
+        return
+    embed = get_config_embed()
+    view = ConfigMainView(interaction.user.id)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await send_log("config", build_log_embed("⚙️ Открыто меню настроек", [f"**Кто:** {interaction.user.mention}"]))
 
 # ================= ПРЕФИКСНЫЕ КОМАНДЫ =================
 
 @bot.command(name="help")
 @check_support_prefix()
 async def prefix_help(ctx: commands.Context):
-    embed = get_help_embed(ctx.author, ctx.channel.id)
-    await ctx.send(embed=embed)
+    embed = get_help_categories_embed(ctx.author, ctx.channel.id)
+    view = HelpCategoriesView(ctx.author.id, ctx.channel.id)
+    await ctx.send(embed=embed, view=view)
+    await send_log("help", build_log_embed("📖 Использовано меню помощи", [f"**Кто:** {ctx.author.mention}"]))
 
 @bot.command(name="addticket", aliases=["t", "ticket"])
 @check_transcript_prefix()
 @commands.cooldown(1, 3.0, commands.BucketType.user)
 async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
-    # Внесено изменение 3: Если команда отправлена без аргументов (.t / .addticket) -> отправляется embed с примером
     if not args:
         await ctx.send(embed=get_addticket_usage_embed())
         return
 
     parts = args.split(maxsplit=2)
-    
-    # Внесено изменение 3: Если передано недостаточно аргументов -> отправляется текстовое сообщение
     if len(parts) < 3:
-        await ctx.send("<:bruh:1521904409582375174> Недостаточно аргументов. Формат: `.addticket [ID модератора] [ссылка] [категория]`")
+        await ctx.send(embed=get_addticket_usage_embed())
         return
 
     staff_raw, transcript, category = parts[0], parts[1], parts[2]
 
-    # Внесено изменение 3: Вывод точечных ошибок текстом
-    if "https://discord.com/" not in transcript:
-        await ctx.send("<:bruh:1521904409582375174> Некорректная ссылка на транскрипт. Она должна содержать `https://discord.com/`.")
-        return
-
-    if category not in VALID_CATEGORIES:
-        cats = ", ".join([f"`{c}`" for c in VALID_CATEGORIES])
-        await ctx.send(f"<:bruh:1521904409582375174> Указана недопустимая категория! Разрешенные: {cats}")
+    if not is_valid_addticket(transcript, category):
+        await ctx.send(embed=get_addticket_usage_embed())
         return
 
     try:
@@ -631,8 +1102,15 @@ async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
         await ctx.send(f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff_raw}`.")
         return
 
-    embed = process_add_ticket(ctx.author, staff_user, transcript, category)
+    embed, ticket_id = process_add_ticket(ctx.author, staff_user, transcript, category)
     await ctx.send(embed=embed)
+    await send_log("addticket", build_log_embed("📥 Добавлен тикет", [
+        f"**Номер лога:** №{ticket_id}",
+        f"**Внёс:** {ctx.author.mention}",
+        f"**Модератор:** <@{staff_id}>",
+        f"**Категория:** {category}",
+        f"**Транскрипт:** {transcript}",
+    ]))
 
 @prefix_add_ticket.error
 async def prefix_add_ticket_error(ctx: commands.Context, error):
@@ -646,14 +1124,72 @@ async def prefix_add_ticket_error(ctx: commands.Context, error):
     if isinstance(error, commands.CheckFailure):
         await ctx.send(f"<:bruh:1521904409582375174> {error}")
         return
-    # Внесено изменение 3: Если произошла неизвестная ошибка синтаксиса
-    await ctx.send("<:bruh:1521904409582375174> Некорректный синтаксис использования команды.")
+    await ctx.send(embed=get_addticket_usage_embed())
+
+@bot.command(name="deleteticket", aliases=["dt"])
+@check_transcript_prefix()
+@commands.cooldown(1, 3.0, commands.BucketType.user)
+async def prefix_delete_ticket_channel(ctx: commands.Context, *, args: str = None):
+    if not args:
+        await ctx.send(embed=get_deleteticket_usage_embed())
+        return
+
+    parts = args.split(maxsplit=1)
+    if len(parts) < 2:
+        await ctx.send(embed=get_deleteticket_usage_embed())
+        return
+
+    log_id_raw, transcript = parts[0], parts[1]
+
+    try:
+        log_id = int(log_id_raw)
+    except ValueError:
+        await ctx.send(f"<:bruh:1521904409582375174> Номер лога должен быть числом: `{log_id_raw}`.")
+        return
+
+    if not is_valid_transcript_link(transcript):
+        await ctx.send(embed=get_deleteticket_usage_embed())
+        return
+
+    embed, error_code = process_delete_ticket_channel(ctx.author, log_id, transcript)
+    if error_code == "not_found":
+        await ctx.send(f"<:bruh:1521904409582375174> Тикет с номером лога `{log_id}` не найден.")
+        return
+    if error_code == "duplicate":
+        await ctx.send("<:bruh:1521904409582375174> Этот транскрипт удаления уже внесён.")
+        return
+
+    await ctx.send(embed=embed)
+    await send_log("deleteticket", build_log_embed("🗑️ Удалён тикет (канал)", [
+        f"**Номер лога:** №{log_id}",
+        f"**Внёс:** {ctx.author.mention}",
+        f"**Транскрипт удаления:** {transcript}",
+    ]))
+
+@prefix_delete_ticket_channel.error
+async def prefix_delete_ticket_channel_error(ctx: commands.Context, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        if is_admin_user(ctx.author):
+            ctx.command.reset_cooldown(ctx)
+            await ctx.reinvoke()
+            return
+        await ctx.send(f"<:zzz:1522341702852022412> Подождите ещё {error.retry_after:.1f} сек.")
+        return
+    if isinstance(error, commands.CheckFailure):
+        await ctx.send(f"<:bruh:1521904409582375174> {error}")
+        return
+    await ctx.send(embed=get_deleteticket_usage_embed())
 
 @bot.command(name="ticketstats", aliases=["ts"])
 @check_support_prefix()
 async def prefix_ticket_stats(ctx: commands.Context, staff: discord.User = None):
-    embed = process_ticket_stats(staff or ctx.author)
+    target = staff or ctx.author
+    embed = process_ticket_stats(target)
     await ctx.send(embed=embed)
+    await send_log("ticketstats", build_log_embed("📊 Просмотр статистики", [
+        f"**Кто смотрел:** {ctx.author.mention}",
+        f"**Чья статистика:** <@{target.id}>",
+    ]))
 
 @prefix_ticket_stats.error
 async def prefix_ticket_stats_error(ctx: commands.Context, error):
@@ -672,48 +1208,72 @@ async def prefix_ticket_logs(ctx: commands.Context, staff: discord.User = None):
         view.message = msg
     else:
         await ctx.send(embed=embed)
+    await send_log("ticketlogs", build_log_embed("📖 Просмотр логов тикетов", [
+        f"**Кто смотрел:** {ctx.author.mention}",
+        f"**Чьи логи:** <@{target.id}>",
+    ]))
 
 @prefix_ticket_logs.error
 async def prefix_ticket_logs_error(ctx: commands.Context, error):
     if isinstance(error, commands.BadArgument):
         await ctx.send(embed=get_ticketlogs_usage_embed())
 
-@bot.command(name="leaderboard", aliases=["lb", "top"])
+@bot.command(name="leaderboard", aliases=["lb", "top", "leaderstats"])
 @check_support_prefix()
 async def prefix_leaderboard(ctx: commands.Context):
     embed = process_leaderboard()
     await ctx.send(embed=embed)
+    await send_log("leaderboard", build_log_embed("🏆 Просмотр лидерборда", [f"**Кто:** {ctx.author.mention}"]))
 
-@bot.command(name="deleteticket", aliases=["dt"])
+@bot.command(name="deletelog", aliases=["del"])
 @check_admin_prefix()
-async def prefix_delete_ticket(ctx: commands.Context, log_id: int = None):
+async def prefix_delete_log(ctx: commands.Context, log_id: int = None):
     if log_id is None:
-        await ctx.send(embed=get_deleteticket_usage_embed())
+        await ctx.send(embed=get_deletelog_usage_embed())
         return
-    ticket = delete_ticket(log_id)
+    ticket = delete_ticket_log(log_id)
     if not ticket:
         await ctx.send(f"<:bruh:1521904409582375174> Лог под номером `{log_id}` не найден.")
         return
     await ctx.send(f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
+    await send_log("deletelog", build_log_embed("❌ Удалён лог тикета", [
+        f"**Номер лога:** №{log_id}",
+        f"**Кто удалил:** {ctx.author.mention}",
+    ]))
 
-@prefix_delete_ticket.error
-async def prefix_delete_ticket_error(ctx: commands.Context, error):
+@prefix_delete_log.error
+async def prefix_delete_log_error(ctx: commands.Context, error):
     if isinstance(error, commands.BadArgument):
-        await ctx.send(embed=get_deleteticket_usage_embed())
+        await ctx.send(embed=get_deletelog_usage_embed())
 
-@bot.command(name="resettickets", aliases=["rt"])
+@bot.command(name="resetlogs", aliases=["rt"])
 @check_admin_prefix()
-async def prefix_reset_tickets(ctx: commands.Context, staff: discord.User = None):
+async def prefix_reset_logs(ctx: commands.Context, staff: discord.User = None):
     if staff is None:
-        await ctx.send(embed=get_resettickets_usage_embed())
+        await ctx.send(embed=get_resetlogs_usage_embed())
         return
     count = reset_tickets(staff.id)
     await ctx.send(f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`.")
+    await send_log("resetlogs", build_log_embed("♻️ Сброшены логи пользователя", [
+        f"**Пользователь:** <@{staff.id}>",
+        f"**Кто сбросил:** {ctx.author.mention}",
+        f"**Удалено записей:** {count}",
+    ]))
 
-@prefix_reset_tickets.error
-async def prefix_reset_tickets_error(ctx: commands.Context, error):
+@prefix_reset_logs.error
+async def prefix_reset_logs_error(ctx: commands.Context, error):
     if isinstance(error, commands.BadArgument):
-        await ctx.send(embed=get_resettickets_usage_embed())
+        await ctx.send(embed=get_resetlogs_usage_embed())
+
+@bot.command(name="config")
+async def prefix_config(ctx: commands.Context):
+    if not is_owner_user(ctx.author):
+        await ctx.send("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.")
+        return
+    embed = get_config_embed()
+    view = ConfigMainView(ctx.author.id)
+    await ctx.send(embed=embed, view=view)
+    await send_log("config", build_log_embed("⚙️ Открыто меню настроек", [f"**Кто:** {ctx.author.mention}"]))
 
 # ================= ЗАПУСК БОТА =================
 
