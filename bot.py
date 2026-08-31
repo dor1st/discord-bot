@@ -32,10 +32,14 @@ tickets_col = db["tickets"]
 counters_col = db["counters"]
 deleted_tickets_col = db["deleted_tickets"]
 settings_col = db["settings"]
+message_stats_col = db["message_stats"]
+bump_stats_col = db["bump_stats"]
 
 # Индексы для предотвращения дублирования транскриптов
 tickets_col.create_index("transcript_url", unique=True, sparse=True)
 deleted_tickets_col.create_index("transcript_url", unique=True, sparse=True)
+message_stats_col.create_index([("channel_id", 1), ("day", 1), ("user_id", 1)])
+bump_stats_col.create_index([("channel_id", 1), ("day", 1), ("user_id", 1)])
 
 
 def get_next_sequence_value(sequence_name: str) -> int:
@@ -53,37 +57,83 @@ def get_next_sequence_value(sequence_name: str) -> int:
 # Укажи сюда свой Discord ID. Команда .config / /config доступна только этому пользователю.
 OWNER_ID = 851443344718430210 
 
-# ================= ТАБЛИЦА ЛОГИРУЕМЫХ КОМАНД (значения по умолчанию) =================
-# True  — действие этой команды будет отправляться в канал логов
-# False — действие этой команды логироваться не будет
-# Значения по умолчанию используются только при первом запуске бота — далее всё
-# хранится в базе данных и меняется через .config / /config.
-LOGGABLE_COMMANDS_DEFAULT = {
-    "addticket": True,      # Добавление тикета/транскрипта в базу
-    "deleteticket": True,   # Удаление тикета (канала) + запись в базу
-    "deletelog": True,      # Удаление конкретного лога из базы
-    "resetlogs": True,      # Полный сброс логов пользователя
-    "ticketlogs": False,    # Просмотр логов модератора
-    "ticketstats": False,   # Просмотр статистики
-    "leaderboard": False,   # Просмотр лидерборда
-    "help": False,          # Использование меню помощи
-    "config": True,         # Изменения в настройках бота
+# ================= КОНФИГ, ХРАНИМЫЙ В MONGODB =================
+
+# Меняется только в коде: сюда вставляются прямые URL header-картинок.
+# Если оставить "", дополнительный header-embed для этого раздела не отправляется.
+HEADER_IMAGES = {
+    "help": "",
+    "config": "",
+    "leaderboard": "",
+    "tickets": "",
+    "results": "",
 }
 
-# ================= НАСТРОЙКИ БОТА, ХРАНИМЫЕ В БД (цвет, footer, канал логов, тумблеры) =================
+# Меняются через .config -> Эмбеды.
+EMOJI_DEFAULTS = {
+    "success": "<a:gif_verify:1522328481956888686>",
+    "warning": "<:zzz:1522341702852022412>",
+    "error": "<:bruh:1521904409582375174>",
+    "permission": "<:imcrine:1543711667647418381>",
+    "info": "ℹ️",
+    "delete": "🗑️",
+}
+
+LOGGABLE_COMMANDS_DEFAULT = {
+    "addticket": True,
+    "deleteticket": True,
+    "deletelog": True,
+    "resetlogs": True,
+    "ticketlogs": False,
+    "ticketstats": False,
+    "leaderboard": False,
+    "count": False,
+    "help": False,
+    "config": True,
+}
+
+# Группы доступа. Роли и команды редактируются через .config -> Доступ.
+PERMISSION_GROUPS_DEFAULT = {
+    "support": {
+        "name": "Поддержка",
+        "emoji": "🛟",
+        "roles": [1501507449860001853, 1322962344040464424],
+        "commands": ["help", "ticketstats", "leaderboard", "count"],
+    },
+    "transcript": {
+        "name": "Транскрипты",
+        "emoji": "🧾",
+        "roles": [1542601770461569044, 1323348388762226759],
+        "commands": ["addticket", "deleteticket", "ticketlogs"],
+    },
+    "admin": {
+        "name": "Администрация",
+        "emoji": "🛡️",
+        "roles": [1322962317885046844, 1502684875868737796],
+        "commands": ["deletelog", "resetlogs"],
+    },
+}
+
+COMMAND_LABELS = {
+    "help": "help",
+    "addticket": "addticket",
+    "deleteticket": "deleteticket",
+    "ticketstats": "ticketstats",
+    "ticketlogs": "ticketlogs",
+    "leaderboard": "leaderboard",
+    "deletelog": "deletelog",
+    "resetlogs": "resetlogs",
+    "count": "подсчет / count",
+}
 
 CONFIG = {}
 
-
 def apply_config_globals():
-    """Обновляет глобальные переменные EMBED_COLOR / FOOTER_TEXT из текущего CONFIG."""
     global EMBED_COLOR, FOOTER_TEXT
     EMBED_COLOR = discord.Color(CONFIG["embed_color"])
     FOOTER_TEXT = CONFIG["footer_text"]
 
-
 def load_config():
-    """Загружает настройки из БД при старте бота, создавая их при первом запуске."""
     global CONFIG
     defaults = {
         "_id": "config",
@@ -91,6 +141,11 @@ def load_config():
         "footer_text": "ТУСОВКА ДОРИСТА",
         "log_channel_id": 1543903998677876836,
         "log_toggles": dict(LOGGABLE_COMMANDS_DEFAULT),
+        "leaderboard_layout": "horizontal",
+        "counting_channel_id": None,
+        "bump_channel_id": None,
+        "permission_groups": {k: dict(v) for k, v in PERMISSION_GROUPS_DEFAULT.items()},
+        "emojis": dict(EMOJI_DEFAULTS),
     }
 
     doc = settings_col.find_one({"_id": "config"})
@@ -99,30 +154,95 @@ def load_config():
         doc = defaults
     else:
         updated = False
+        for key, value in defaults.items():
+            if key not in doc:
+                doc[key] = value
+                updated = True
+
         toggles = doc.get("log_toggles", {})
         for cmd, default_value in LOGGABLE_COMMANDS_DEFAULT.items():
             if cmd not in toggles:
                 toggles[cmd] = default_value
                 updated = True
         doc["log_toggles"] = toggles
-        for key, value in defaults.items():
-            if key not in doc:
-                doc[key] = value
+
+        groups = doc.get("permission_groups", {})
+        for group_key, group_default in PERMISSION_GROUPS_DEFAULT.items():
+            if group_key not in groups:
+                groups[group_key] = dict(group_default)
                 updated = True
+            else:
+                for key, value in group_default.items():
+                    if key not in groups[group_key]:
+                        groups[group_key][key] = value
+                        updated = True
+        doc["permission_groups"] = groups
+
+        emojis = doc.get("emojis", {})
+        for key, value in EMOJI_DEFAULTS.items():
+            if key not in emojis:
+                emojis[key] = value
+                updated = True
+        doc["emojis"] = emojis
+
+        if doc.get("leaderboard_layout") not in ("horizontal", "vertical"):
+            doc["leaderboard_layout"] = "horizontal"
+            updated = True
+
         if updated:
             settings_col.update_one({"_id": "config"}, {"$set": doc}, upsert=True)
 
     CONFIG = doc
     apply_config_globals()
 
-
 def update_config(patch: dict):
-    """Обновляет настройки бота и в БД, и в кэше памяти."""
     global CONFIG
     settings_col.update_one({"_id": "config"}, {"$set": patch}, upsert=True)
-    CONFIG.update(patch)
+    for key, value in patch.items():
+        if "." not in key:
+            CONFIG[key] = value
+            continue
+        target = CONFIG
+        parts = key.split(".")
+        for part in parts[:-1]:
+            if not isinstance(target.get(part), dict):
+                target[part] = {}
+            target = target[part]
+        target[parts[-1]] = value
     apply_config_globals()
 
+def get_emoji(name: str) -> str:
+    return CONFIG.get("emojis", {}).get(name, EMOJI_DEFAULTS.get(name, ""))
+
+def make_status_embed(title: str, message: str, kind: str = "info") -> discord.Embed:
+    emoji = get_emoji(kind)
+    embed = discord.Embed(
+        title=title,
+        description=f"{emoji} {message}" if emoji else message,
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text=FOOTER_TEXT)
+    return embed
+
+def make_header_embed(header_key: str):
+    url = HEADER_IMAGES.get(header_key, "")
+    if not url:
+        return None
+    embed = discord.Embed(color=EMBED_COLOR)
+    embed.set_image(url=url)
+    return embed
+
+async def send_embed_with_header(destination, embed: discord.Embed, header_key: str | None = None, **kwargs):
+    header = make_header_embed(header_key) if header_key else None
+    if isinstance(destination, discord.Interaction):
+        if header:
+            await destination.response.send_message(embed=header, **kwargs)
+            return await destination.followup.send(embed=embed, wait=True, **kwargs)
+        await destination.response.send_message(embed=embed, **kwargs)
+        return await destination.original_response()
+    if header:
+        await destination.send(embed=header)
+    return await destination.send(embed=embed, **kwargs)
 
 load_config()
 
@@ -139,72 +259,84 @@ LOGS_PER_PAGE = 3
 # ================= НАСТРОЙКА РОЛЕЙ И КАНАЛОВ =================
 
 ALLOWED_CHANNEL_IDS = [1322968592202993746, 1537220150267220018]
-
-SUPPORT_ROLE_IDS = [1501507449860001853, 1322962344040464424]
-TRANSCRIPT_ROLE_IDS = [1542601770461569044, 1323348388762226759]
-ADMIN_ROLE_IDS = [1322962317885046844, 1502684875868737796]
-
 VALID_CATEGORIES = ["Помощь по серверу", "Получение призов", "Получение роли", "Покупка рекламы"]
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ПРОВЕРКИ =================
+def get_group(group_key: str) -> dict:
+    return CONFIG.get("permission_groups", {}).get(group_key, {})
 
-def has_role_access(user: discord.Member | discord.User, role_ids: list[int]) -> bool:
-    if not isinstance(user, discord.Member):
-        return False
-    if user.guild_permissions.administrator:
-        return True
-    return any(role.id in role_ids for role in user.roles)
-
-def is_admin_user(user: discord.Member | discord.User) -> bool:
-    return has_role_access(user, ADMIN_ROLE_IDS)
+def get_group_role_ids(group_key: str) -> list[int]:
+    return [int(x) for x in get_group(group_key).get("roles", [])]
 
 def is_owner_user(user: discord.Member | discord.User) -> bool:
     return user.id == OWNER_ID
 
-def check_access(user: discord.Member | discord.User, channel_id: int, role_ids: list[int]) -> tuple[bool, str]:
+def user_in_group(user: discord.Member | discord.User, group_key: str) -> bool:
     if not isinstance(user, discord.Member):
-        return False, "Команды работают только на сервере."
+        return False
+    if is_owner_user(user) or user.guild_permissions.administrator:
+        return True
+    return any(role.id in get_group_role_ids(group_key) for role in user.roles)
 
-    if user.guild_permissions.administrator:
-        return True, ""
+def has_role_access(user: discord.Member | discord.User, role_ids: list[int]) -> bool:
+    if not isinstance(user, discord.Member):
+        return False
+    if is_owner_user(user) or user.guild_permissions.administrator:
+        return True
+    return any(role.id in role_ids for role in user.roles)
 
-    if not has_role_access(user, role_ids):
-        return False, "У вас недостаточно ролей для использования этой команды."
-
-    if ALLOWED_CHANNEL_IDS and channel_id not in ALLOWED_CHANNEL_IDS:
-        channels_mention = ", ".join([f"<#{cid}>" for cid in ALLOWED_CHANNEL_IDS])
-        return False, f"Эта команда доступна только в каналах: {channels_mention}"
-
-    return True, ""
+def is_admin_user(user: discord.Member | discord.User) -> bool:
+    return user_in_group(user, "admin")
 
 def get_user_group_name(user: discord.Member | discord.User, channel_id: int) -> str:
     if is_owner_user(user):
         return "Владелец"
-    if is_admin_user(user):
-        return "Администрация"
-    if has_role_access(user, TRANSCRIPT_ROLE_IDS):
-        return "Транскрипты"
-    if has_role_access(user, SUPPORT_ROLE_IDS):
-        return "Поддержка"
+    for key in ("admin", "transcript", "support"):
+        if user_in_group(user, key):
+            return get_group(key).get("name", key)
     return "Пользователь"
 
-def check_access_decorator(role_ids: list[int], is_slash: bool = False):
+def check_access(user: discord.Member | discord.User, channel_id: int, command_name: str) -> tuple[bool, str]:
+    if not isinstance(user, discord.Member):
+        return False, "Команды работают только на сервере."
+    if is_owner_user(user) or user.guild_permissions.administrator:
+        return True, ""
+    if ALLOWED_CHANNEL_IDS and channel_id not in ALLOWED_CHANNEL_IDS:
+        channels_mention = ", ".join(f"<#{cid}>" for cid in ALLOWED_CHANNEL_IDS)
+        return False, f"Эта команда доступна только в каналах: {channels_mention}"
+
+    matched_group = False
+    for group in CONFIG.get("permission_groups", {}).values():
+        role_ids = [int(x) for x in group.get("roles", [])]
+        if any(role.id in role_ids for role in user.roles):
+            matched_group = True
+            if command_name in group.get("commands", []):
+                return True, ""
+    if not matched_group:
+        return False, "У вас недостаточно ролей для использования этой команды."
+    return False, "Ваша группа не имеет доступа к этой команде. Доступ можно изменить в конфигурации бота."
+
+def check_access_decorator(role_ids=None, is_slash: bool = False, command_name: str | None = None):
+    configured_command_name = command_name
     async def predicate(target):
         user = target.user if is_slash else target.author
         channel_id = target.channel_id if is_slash else target.channel.id
-        ok, msg = check_access(user, channel_id, role_ids)
+        command = getattr(target, "command", None)
+        current_command_name = configured_command_name or getattr(command, "name", "") or ""
+        ok, msg = check_access(user, channel_id, current_command_name)
         if not ok:
-            raise app_commands.AppCommandError(msg) if is_slash else commands.CheckFailure(msg)
+            if is_slash:
+                raise app_commands.AppCommandError(msg)
+            raise commands.CheckFailure(msg)
         return True
     return app_commands.check(predicate) if is_slash else commands.check(predicate)
 
-def check_support_prefix(): return check_access_decorator(SUPPORT_ROLE_IDS)
-def check_transcript_prefix(): return check_access_decorator(TRANSCRIPT_ROLE_IDS)
-def check_admin_prefix(): return check_access_decorator(ADMIN_ROLE_IDS)
-
-def check_support_slash(): return check_access_decorator(SUPPORT_ROLE_IDS, is_slash=True)
-def check_transcript_slash(): return check_access_decorator(TRANSCRIPT_ROLE_IDS, is_slash=True)
-def check_admin_slash(): return check_access_decorator(ADMIN_ROLE_IDS, is_slash=True)
+# Имена оставлены, чтобы не пришлось менять декораторы существующих команд.
+def check_support_prefix(command_name=None): return check_access_decorator(command_name=command_name)
+def check_transcript_prefix(command_name=None): return check_access_decorator(command_name=command_name)
+def check_admin_prefix(command_name=None): return check_access_decorator(command_name=command_name)
+def check_support_slash(command_name=None): return check_access_decorator(is_slash=True, command_name=command_name)
+def check_transcript_slash(command_name=None): return check_access_decorator(is_slash=True, command_name=command_name)
+def check_admin_slash(command_name=None): return check_access_decorator(is_slash=True, command_name=command_name)
 
 def is_valid_addticket(transcript_url: str, category: str) -> bool:
     return "https://discord.com/" in transcript_url and category in VALID_CATEGORIES
@@ -250,24 +382,106 @@ async def send_log(command_name: str, embed: discord.Embed):
 
 # ================= ОБРАБОТКА ОШИБОК =================
 
+async def send_error_ctx(ctx: commands.Context, message: str, title: str = "Ошибка"):
+    await ctx.send(embed=make_status_embed(title, message, "error"))
+
+async def send_error_interaction(interaction: discord.Interaction, message: str, title: str = "Ошибка", ephemeral: bool = True):
+    embed = make_status_embed(title, message, "error")
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.CheckFailure):
-        await ctx.send(f"<:bruh:1521904409582375174> {error}")
+        await send_error_ctx(ctx, str(error) or "У вас нет доступа к этой команде.", "Недостаточно прав")
         return
-    raise error
+    await send_error_ctx(ctx, str(error) or "Произошла ошибка при выполнении команды.")
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CommandNotFound):
         return
-    msg = f"<:bruh:1521904409582375174> {error}" if str(error) else "<:bruh:1521904409582375174> Произошла ошибка при выполнении команды."
-    if interaction.response.is_done():
-        await interaction.followup.send(msg, ephemeral=True)
-    else:
-        await interaction.response.send_message(msg, ephemeral=True)
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await send_error_interaction(interaction, f"Подождите ещё {error.retry_after:.1f} сек.", "Команда на кулдауне")
+        return
+    await send_error_interaction(interaction, str(error) or "Произошла ошибка при выполнении команды.")
+
+# ================= СТАТИСТИКА СООБЩЕНИЙ И BUMP =================
+
+def utc_day(dt=None):
+    dt = dt or datetime.now(timezone.utc)
+    return dt.date().isoformat()
+
+def record_message_stat(message: discord.Message):
+    channel_id = CONFIG.get("counting_channel_id")
+    if not channel_id or message.channel.id != channel_id or message.author.bot:
+        return
+    message_stats_col.update_one(
+        {"channel_id": channel_id, "user_id": message.author.id, "day": utc_day()},
+        {"$inc": {"count": 1}},
+        upsert=True,
+    )
+
+def record_bump_stat(interaction: discord.Interaction):
+    channel_id = CONFIG.get("bump_channel_id")
+    if not channel_id or interaction.channel_id != channel_id or interaction.user.bot:
+        return
+    if interaction.type != discord.InteractionType.application_command:
+        return
+    command_name = (interaction.data or {}).get("name")
+    if not command_name:
+        return
+    bump_stats_col.update_one(
+        {"channel_id": channel_id, "user_id": interaction.user.id, "day": utc_day()},
+        {"$inc": {"count": 1}, "$set": {"last_command": command_name}},
+        upsert=True,
+    )
+
+def process_results():
+    now = datetime.now(timezone.utc)
+    d7 = (now - timedelta(days=7)).date().isoformat()
+    d30 = (now - timedelta(days=30)).date().isoformat()
+
+    def top_stats(collection, start_day, channel_id):
+        if not channel_id:
+            return []
+        pipeline = [
+            {"$match": {"channel_id": channel_id, "day": {"$gte": start_day}}},
+            {"$group": {"_id": "$user_id", "count": {"$sum": "$count"}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10},
+        ]
+        return [(doc["_id"], doc["count"]) for doc in collection.aggregate(pipeline)]
+
+    def fmt(rows):
+        if not rows:
+            return "— *Нет данных*"
+        return "\n".join(f"`{i}.` <@{uid}> — **{count}**" for i, (uid, count) in enumerate(rows, 1))
+
+    embed = discord.Embed(title=f"{get_emoji('info')} Итоги", color=EMBED_COLOR)
+    embed.add_field(name="💬 Сообщения — 7 дней", value=fmt(top_stats(message_stats_col, d7, CONFIG.get("counting_channel_id"))), inline=True)
+    embed.add_field(name="💬 Сообщения — 30 дней", value=fmt(top_stats(message_stats_col, d30, CONFIG.get("counting_channel_id"))), inline=True)
+    embed.add_field(name="🚀 Bump — 7 дней", value=fmt(top_stats(bump_stats_col, d7, CONFIG.get("bump_channel_id"))), inline=True)
+    embed.add_field(name="🚀 Bump — 30 дней", value=fmt(top_stats(bump_stats_col, d30, CONFIG.get("bump_channel_id"))), inline=True)
+    count_channel = CONFIG.get("counting_channel_id")
+    bump_channel = CONFIG.get("bump_channel_id")
+    embed.add_field(name="Канал считалки", value=f"<#{count_channel}>" if count_channel else "Не установлен", inline=True)
+    embed.add_field(name="Канал bump", value=f"<#{bump_channel}>" if bump_channel else "Не установлен", inline=True)
+    embed.set_footer(text=FOOTER_TEXT)
+    return embed
+
+@bot.event
+async def on_message(message: discord.Message):
+    record_message_stat(message)
+    await bot.process_commands(message)
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    record_bump_stat(interaction)
 
 # ================= БИЗНЕС-ЛОГИКА ТИКЕТОВ =================
 
@@ -311,7 +525,7 @@ def process_ticket_logs(target_user: discord.User, page: int = 1) -> tuple[disco
     if not logs:
         embed = discord.Embed(
             title=f"Тикеты — {target_user.name}",
-            description="<:bruh:1521904409582375174> У этого модератора нет ни одного тикета.",
+            description=f"{get_emoji('error')} У этого модератора нет ни одного тикета.",
             color=EMBED_COLOR,
         )
         embed.set_footer(text=f"Страница 1/1 (0 логов) • {FOOTER_TEXT}")
@@ -368,10 +582,7 @@ class TicketLogsPaginationView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "<:bruh:1521904409582375174> Вы не можете переключать страницы в чужом меню.",
-                ephemeral=True
-            )
+            await send_error_interaction(interaction, "Вы не можете переключать страницы в чужом меню.", "Доступ запрещён")
             return False
         return True
 
@@ -473,18 +684,19 @@ def process_leaderboard():
         return "\n".join([f"`{idx}.` <@{u_id}> — **{count}** {unit_label}" for idx, (u_id, count) in enumerate(top_list, 1)])
 
     embed = discord.Embed(title="<:sparkles:1522342290494849034> Лидерборд тикетов и транскриптов", color=EMBED_COLOR)
+    layout_inline = CONFIG.get("leaderboard_layout", "horizontal") == "horizontal"
 
-    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (7 дн.)", value=format_top(get_top(tickets_col, "staff_id", d7)), inline=True)
-    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (7 дн.)", value=format_top(get_top(tickets_col, "author_id", d7, True), "транскриптов"), inline=True)
-    embed.add_field(name="🗑️ Удалено тикетов (7 дн.)", value=format_top(get_top(deleted_tickets_col, "staff_id", d7), "удалений"), inline=True)
+    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (7 дн.)", value=format_top(get_top(tickets_col, "staff_id", d7)), inline=layout_inline)
+    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (7 дн.)", value=format_top(get_top(tickets_col, "author_id", d7, True), "транскриптов"), inline=layout_inline)
+    embed.add_field(name="🗑️ Удалено тикетов (7 дн.)", value=format_top(get_top(deleted_tickets_col, "staff_id", d7), "удалений"), inline=layout_inline)
 
-    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (30 дн.)", value=format_top(get_top(tickets_col, "staff_id", d30)), inline=True)
-    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (30 дн.)", value=format_top(get_top(tickets_col, "author_id", d30, True), "транскриптов"), inline=True)
-    embed.add_field(name="🗑️ Удалено тикетов (30 дн.)", value=format_top(get_top(deleted_tickets_col, "staff_id", d30), "удалений"), inline=True)
+    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (30 дн.)", value=format_top(get_top(tickets_col, "staff_id", d30)), inline=layout_inline)
+    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (30 дн.)", value=format_top(get_top(tickets_col, "author_id", d30, True), "транскриптов"), inline=layout_inline)
+    embed.add_field(name="🗑️ Удалено тикетов (30 дн.)", value=format_top(get_top(deleted_tickets_col, "staff_id", d30), "удалений"), inline=layout_inline)
 
-    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (Все время)", value=format_top(get_top(tickets_col, "staff_id")), inline=True)
-    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (Все время)", value=format_top(get_top(tickets_col, "author_id", exclude_zero=True), "транскриптов"), inline=True)
-    embed.add_field(name="🗑️ Удалено тикетов (Все время)", value=format_top(get_top(deleted_tickets_col, "staff_id"), "удалений"), inline=True)
+    embed.add_field(name="<:ticket:1522343287816716379> Тикетов (Все время)", value=format_top(get_top(tickets_col, "staff_id")), inline=layout_inline)
+    embed.add_field(name="<:logs:1522340749998428160> Транскриптов (Все время)", value=format_top(get_top(tickets_col, "author_id", exclude_zero=True), "транскриптов"), inline=layout_inline)
+    embed.add_field(name="🗑️ Удалено тикетов (Все время)", value=format_top(get_top(deleted_tickets_col, "staff_id"), "удалений"), inline=layout_inline)
 
     embed.set_footer(text=f"Сегодня в {now.strftime('%H:%M')} • {FOOTER_TEXT}")
     return embed
@@ -544,81 +756,59 @@ def process_delete_ticket_channel(author_user: discord.User, log_id: int, transc
 # ================= EMBEDS ПОМОЩИ =================
 
 def get_help_categories_embed(user: discord.Member | discord.User, channel_id: int):
-    group_name = get_user_group_name(user, channel_id)
     embed = discord.Embed(
         title="<:staff:1522338131339251823> Меню команд бота",
-        description="Выберите категорию команд ниже.\nВ будущем здесь появится больше категорий.",
+        description="Выберите категорию команд ниже.",
         color=EMBED_COLOR,
     )
     embed.add_field(name="🎫 Тикеты", value="Команды для работы с тикетами и транскриптами.", inline=False)
-    embed.set_footer(text=f"Ваша текущая группа: {group_name} • {FOOTER_TEXT}")
+    embed.add_field(name="🏆 Итоги", value="Статистика сообщений в считалке и использования slash-команд в bump-канале.", inline=False)
+    if is_owner_user(user):
+        embed.add_field(name="⚙️ Конфиг", value="Настройки бота, прав, логов, каналов и оформления.", inline=False)
+    embed.set_footer(text=f"Ваша текущая группа: {get_user_group_name(user, channel_id)} • {FOOTER_TEXT}")
     return embed
 
 def get_help_embed(user: discord.Member | discord.User, channel_id: int):
-    group_name = get_user_group_name(user, channel_id)
-
     embed = discord.Embed(
         title="<:ticket:1522343287816716379> Категория: Тикеты",
-        description="Используй префикс `.` или слэш-команды `/`",
+        description="Используй префикс `.` или слэш-команды `/`.",
         color=EMBED_COLOR,
     )
-
-    if has_role_access(user, SUPPORT_ROLE_IDS):
-        embed.add_field(
-            name="<:ticket:1522343287816716379> Команды Support",
-            value=(
-                "`.help` — Показать меню команд.\n\n"
-                "`.ticketstats [ID / упоминание]`\n> *Посмотреть статистику тикетов, транскриптов и удалений.*\n\n"
-                "`.leaderboard`\n> *Посмотреть топ модераторов по тикетам, транскриптам и удалениям.*"
-            ),
-            inline=False,
-        )
-
-    if has_role_access(user, TRANSCRIPT_ROLE_IDS):
-        embed.add_field(
-            name="<:logs:1522340749998428160> Команды Transcript",
-            value=(
-                "`.addticket [ID модератора] [ссылка] [категория]`\n> *Записать новый обработанный тикет в базу данных.*\n\n"
-                "`.ticketlogs [ID / упоминание]`\n> *Посмотреть логи тикетов модератора (с кнопками листания).*\n\n"
-                "`.deleteticket [номер лога] [ссылка на транскрипт]`\n> *Записать удаление тикета (канала) и добавить +1 удалённый тикет модератору.*"
-            ),
-            inline=False,
-        )
-
-    if is_admin_user(user):
-        embed.add_field(
-            name="<:mod:1522343179205087363> Команды Администрации",
-            value=(
-                "`.deletelog [ID лога]`\n> *Удалить конкретный лог тикета по ID.*\n\n"
-                "`.resetlogs [ID / упоминание]`\n> *Очистить абсолютно все логи модератора (тикеты, транскрипты, удаления).*"
-            ),
-            inline=False,
-        )
-
+    commands_help = {
+        "help": "`.help` / `/help` — меню команд.",
+        "ticketstats": "`.ticketstats [ID / упоминание]` — статистика тикетов.",
+        "leaderboard": "`.leaderboard` — лидерборд тикетов, транскриптов и удалений.",
+        "addticket": "`.addticket [ID] [ссылка] [категория]` — добавить тикет.",
+        "ticketlogs": "`.ticketlogs [ID / упоминание]` — логи тикетов.",
+        "deleteticket": "`.deleteticket [номер] [ссылка]` — записать удаление тикета.",
+        "deletelog": "`.deletelog [ID лога]` — удалить конкретный лог.",
+        "resetlogs": "`.resetlogs [ID / упоминание]` — сбросить логи пользователя.",
+        "count": "`.подсчет` / `/count` — показать итоги.",
+    }
+    for group_key, group in CONFIG.get("permission_groups", {}).items():
+        visible = [commands_help[c] for c in group.get("commands", []) if c in commands_help and user_in_group(user, group_key)]
+        if visible:
+            embed.add_field(
+                name=f"{group.get('emoji', '•')} {group.get('name', group_key)}",
+                value="\n\n".join(visible),
+                inline=False,
+            )
     if is_owner_user(user):
-        embed.add_field(
-            name="⚙️ Команды Владельца",
-            value="`.config`\n> *Открыть меню настроек бота (цвет, footer, канал логов, логируемые команды).*",
-            inline=False,
-        )
+        embed.add_field(name="⚙️ Владелец", value="`.config` — открыть настройки бота.", inline=False)
+    embed.set_footer(text=f"Ваша текущая группа: {get_user_group_name(user, channel_id)} • {FOOTER_TEXT}")
+    return embed
 
-    embed.set_footer(text=f"Ваша текущая группа: {group_name} • {FOOTER_TEXT}")
+def get_results_usage_embed():
+    embed = discord.Embed(title="Команда: подсчет", description="Показать статистику считалки и bump за 7 и 30 дней.", color=EMBED_COLOR)
+    embed.add_field(name="Использование", value="`.подсчет` / `.count` / `/count`", inline=False)
+    embed.set_footer(text=FOOTER_TEXT)
     return embed
 
 def get_addticket_usage_embed():
     categories_str = ", ".join([f"`{c}`" for c in VALID_CATEGORIES])
     embed = discord.Embed(color=EMBED_COLOR, title="Команда: addticket", description="Добавить новый лог об обработанном тикете")
     embed.add_field(name="Кулдаун:", value="3 секунды (Для Администрации отсутствует)", inline=False)
-    embed.add_field(
-        name="Правила аргументов:",
-        value=(
-            "1. Ссылка должна содержать: `https://discord.com/`\n"
-            "2. Вы **не можете** указать свой собственный ID\n"
-            "3. Один и тот же транскрипт нельзя вносить дважды\n"
-            f"4. Допустимые категории: {categories_str}"
-        ),
-        inline=False,
-    )
+    embed.add_field(name="Правила аргументов:", value=("1. Ссылка должна содержать: `https://discord.com/`\n2. Вы **не можете** указать свой собственный ID\n3. Один и тот же транскрипт нельзя вносить дважды\n4. Допустимые категории: " + categories_str), inline=False)
     embed.add_field(name="Использование:", value="`.addticket [ID модератора] [ссылка на транскрипт] [категория]`", inline=False)
     embed.add_field(name="Пример:", value="`.addticket 851443344718430210 https://discord.com/channels/... Получение призов`", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
@@ -640,16 +830,7 @@ def get_ticketlogs_usage_embed():
 
 def get_deleteticket_usage_embed():
     embed = discord.Embed(color=EMBED_COLOR, title="Команда: deleteticket", description="Записать удаление тикета (канала) в базу данных")
-    embed.add_field(
-        name="Правила аргументов:",
-        value=(
-            "1. Номер лога — это номер, который бот показал при `.addticket` (поле «Номер лога»)\n"
-            "2. Ссылка должна содержать: `https://discord.com/`\n"
-            "3. Один и тот же транскрипт удаления нельзя внести дважды\n"
-            "4. Модератору, который изначально вёл этот тикет, добавляется +1 удалённый тикет"
-        ),
-        inline=False,
-    )
+    embed.add_field(name="Правила аргументов:", value=("1. Номер лога — номер из `.addticket`\n2. Ссылка должна содержать: `https://discord.com/`\n3. Один и тот же транскрипт удаления нельзя внести дважды\n4. Ответственному модератору добавляется +1 удалённый тикет"), inline=False)
     embed.add_field(name="Использование:", value="`.deleteticket [номер лога] [ссылка на транскрипт]`", inline=False)
     embed.add_field(name="Пример:", value="`.deleteticket 42 https://discord.com/channels/...`", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
@@ -669,10 +850,9 @@ def get_resetlogs_usage_embed():
     embed.set_footer(text=FOOTER_TEXT)
     return embed
 
-# ================= МЕНЮ ПОМОЩИ С КАТЕГОРИЯМИ (КНОПКИ) =================
+# ================= МЕНЮ ПОМОЩИ =================
 
-class TicketHelpView(discord.ui.View):
-    """Показывается после нажатия на категорию «Тикеты». Содержит кнопку «Назад»."""
+class HelpBaseView(discord.ui.View):
     def __init__(self, author_id: int, channel_id: int):
         super().__init__(timeout=120)
         self.author_id = author_id
@@ -680,226 +860,302 @@ class TicketHelpView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "<:bruh:1521904409582375174> Это меню вызвали не вы.", ephemeral=True
-            )
+            await send_error_interaction(interaction, "Это меню вызвали не вы.", "Доступ запрещён")
             return False
         return True
 
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+class TicketHelpView(HelpBaseView):
     @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary)
     async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = get_help_categories_embed(interaction.user, self.channel_id)
-        view = HelpCategoriesView(self.author_id, self.channel_id)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(embed=get_help_categories_embed(interaction.user, self.channel_id), view=HelpCategoriesView(self.author_id, self.channel_id))
 
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+class ResultsHelpView(HelpBaseView):
+    @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_help_categories_embed(interaction.user, self.channel_id), view=HelpCategoriesView(self.author_id, self.channel_id))
 
-class HelpCategoriesView(discord.ui.View):
-    """Стартовое меню помощи со списком категорий. Пока только «Тикеты» — новые
-    категории добавляются простым добавлением новой @discord.ui.button ниже."""
-    def __init__(self, author_id: int, channel_id: int):
-        super().__init__(timeout=120)
-        self.author_id = author_id
-        self.channel_id = channel_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "<:bruh:1521904409582375174> Это меню вызвали не вы.", ephemeral=True
-            )
-            return False
-        return True
-
+class HelpCategoriesView(HelpBaseView):
     @discord.ui.button(label="Тикеты", emoji="🎫", style=discord.ButtonStyle.primary)
     async def tickets_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = get_help_embed(interaction.user, self.channel_id)
-        view = TicketHelpView(self.author_id, self.channel_id)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(embed=get_help_embed(interaction.user, self.channel_id), view=TicketHelpView(self.author_id, self.channel_id))
 
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+    @discord.ui.button(label="Итоги", emoji="🏆", style=discord.ButtonStyle.primary)
+    async def results_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=process_results(), view=ResultsHelpView(self.author_id, self.channel_id))
+
+    @discord.ui.button(label="Конфиг", emoji="⚙️", style=discord.ButtonStyle.secondary)
+    async def config_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_owner_user(interaction.user):
+            await send_error_interaction(interaction, "Эта категория доступна только владельцу бота.", "Доступ запрещён")
+            return
+        await interaction.response.edit_message(embed=get_config_home_embed(), view=ConfigMainView(self.author_id))
 
 # ================= МЕНЮ НАСТРОЕК БОТА (.config) =================
 
-def get_config_embed():
-    channel_id = CONFIG.get("log_channel_id")
-    channel_mention = f"<#{channel_id}>" if channel_id else "Не установлен"
+CONFIG_SECTIONS = {
+    "general": ("⚙️", "General", "Цвет и footer"),
+    "tickets": ("🎫", "Тикеты", "Канал логов и логируемые команды"),
+    "permissions": ("🛡️", "Доступ", "Группы, роли и команды"),
+    "leaderboard": ("🏆", "Лидерборды", "Горизонтально или вертикально"),
+    "results": ("📊", "Итоги", "Каналы считалки и bump"),
+    "embeds": ("🎨", "Эмбеды", "Статусные эмодзи"),
+}
 
-    toggles_lines = []
-    for cmd in LOGGABLE_COMMANDS_DEFAULT:
-        state = "✅" if CONFIG.get("log_toggles", {}).get(cmd, False) else "❌"
-        toggles_lines.append(f"{state} `{cmd}`")
-
-    embed = discord.Embed(
-        title="⚙️ Настройки бота",
-        description="Меню настроек доступно только владельцу бота. Выберите пункт в списке ниже.",
-        color=EMBED_COLOR,
-    )
-    embed.add_field(name="Цвет embed", value=f"`#{CONFIG['embed_color']:06X}`", inline=True)
-    embed.add_field(name="Footer текст", value=CONFIG["footer_text"], inline=True)
-    embed.add_field(name="Канал логов", value=channel_mention, inline=True)
-    embed.add_field(name="Команды для логов", value="\n".join(toggles_lines), inline=False)
+def get_config_home_embed():
+    embed = discord.Embed(title="⚙️ Настройки бота", description="Выберите категорию настроек ниже.", color=EMBED_COLOR)
+    for key, (emoji, name, desc) in CONFIG_SECTIONS.items():
+        embed.add_field(name=f"{emoji} {name}", value=desc, inline=True)
+    embed.add_field(name="🖼️ Header-изображения", value="Ссылки задаются только в переменной `HEADER_IMAGES` в коде.", inline=False)
     embed.set_footer(text=FOOTER_TEXT)
     return embed
 
-class ColorModal(discord.ui.Modal, title="Изменить цвет embed"):
-    color_input = discord.ui.TextInput(label="HEX цвет без #, например 212121", placeholder="212121", min_length=6, max_length=6)
+def get_config_section_embed(section: str):
+    emoji, name, desc = CONFIG_SECTIONS[section]
+    embed = discord.Embed(title=f"{emoji} Конфиг → {name}", description=desc, color=EMBED_COLOR)
+    if section == "general":
+        embed.add_field(name="Цвет embed", value=f"`#{CONFIG['embed_color']:06X}`", inline=True)
+        embed.add_field(name="Footer", value=CONFIG["footer_text"], inline=True)
+    elif section == "tickets":
+        ch = CONFIG.get("log_channel_id")
+        enabled = [cmd for cmd, state in CONFIG.get("log_toggles", {}).items() if state]
+        embed.add_field(name="Канал логов", value=f"<#{ch}>" if ch else "Не установлен", inline=False)
+        embed.add_field(name="Логируемые команды", value="\n".join(f"`{x}`" for x in enabled) or "—", inline=False)
+    elif section == "permissions":
+        for key, group in CONFIG.get("permission_groups", {}).items():
+            roles = ", ".join(f"<@&{r}>" for r in group.get("roles", [])) or "—"
+            commands = ", ".join(f"`{c}`" for c in group.get("commands", [])) or "—"
+            embed.add_field(name=f"{group.get('emoji','')} {group.get('name', key)}", value=f"**Роли:** {roles}\n**Команды:** {commands}", inline=False)
+    elif section == "leaderboard":
+        embed.add_field(name="Расположение категорий", value="Горизонтально" if CONFIG.get("leaderboard_layout") == "horizontal" else "Вертикально", inline=False)
+    elif section == "results":
+        count = CONFIG.get("counting_channel_id")
+        bump = CONFIG.get("bump_channel_id")
+        embed.add_field(name="Канал считалки", value=f"<#{count}>" if count else "Не установлен", inline=True)
+        embed.add_field(name="Канал bump", value=f"<#{bump}>" if bump else "Не установлен", inline=True)
+    elif section == "embeds":
+        embed.add_field(name="Статусные эмодзи", value="\n".join(f"{get_emoji(k)} `{k}`" for k in EMOJI_DEFAULTS), inline=False)
+    embed.set_footer(text=FOOTER_TEXT)
+    return embed
 
+class ConfigBaseView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await send_error_interaction(interaction, "Эта команда доступна только владельцу бота.", "Доступ запрещён")
+            return False
+        return True
+
+class ConfigMainView(ConfigBaseView):
+    @discord.ui.select(
+        placeholder="Выберите категорию настроек...",
+        options=[discord.SelectOption(label=name, value=key, emoji=emoji, description=desc) for key, (emoji, name, desc) in CONFIG_SECTIONS.items()],
+    )
+    async def section_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        section = select.values[0]
+        views = {
+            "general": GeneralConfigView,
+            "tickets": TicketConfigView,
+            "permissions": PermissionConfigView,
+            "leaderboard": LeaderboardConfigView,
+            "results": ResultsConfigView,
+            "embeds": EmbedConfigView,
+        }
+        await interaction.response.edit_message(embed=get_config_section_embed(section), view=views[section](self.owner_id))
+
+class GeneralConfigView(ConfigBaseView):
+    @discord.ui.button(label="Цвет embed", emoji="🎨", style=discord.ButtonStyle.primary)
+    async def color_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(ColorModal())
+
+    @discord.ui.button(label="Footer", emoji="📝", style=discord.ButtonStyle.primary)
+    async def footer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(FooterModal())
+
+    @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_config_home_embed(), view=ConfigMainView(self.owner_id))
+
+class ColorModal(discord.ui.Modal, title="Изменить цвет embed"):
+    color_input = discord.ui.TextInput(label="HEX цвет без #", placeholder="212121", min_length=6, max_length=6)
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.color_input.value.strip().lstrip("#")
         try:
             value = int(raw, 16)
-            if not (0 <= value <= 0xFFFFFF):
+            if not 0 <= value <= 0xFFFFFF:
                 raise ValueError
         except ValueError:
-            await interaction.response.send_message(f"<:bruh:1521904409582375174> Некорректный HEX цвет: `{raw}`", ephemeral=True)
+            await send_error_interaction(interaction, f"Некорректный HEX цвет: `{raw}`.")
             return
         update_config({"embed_color": value})
-        await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Цвет embed изменён на `#{raw.upper()}`.", ephemeral=True)
-        await send_log("config", build_log_embed("⚙️ Изменена настройка бота", [
-            f"**Кто изменил:** {interaction.user.mention}",
-            "**Что изменено:** Цвет embed",
-            f"**Новое значение:** `#{raw.upper()}`",
-        ]))
+        await interaction.response.send_message(embed=make_status_embed("Настройка изменена", f"Цвет embed изменён на `#{raw.upper()}`.", "success"), ephemeral=True)
 
 class FooterModal(discord.ui.Modal, title="Изменить footer текст"):
     footer_input = discord.ui.TextInput(label="Новый текст footer", placeholder="ТУСОВКА ДОРИСТА", max_length=100)
-
     async def on_submit(self, interaction: discord.Interaction):
         update_config({"footer_text": self.footer_input.value})
-        await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Footer текст изменён на: `{self.footer_input.value}`.", ephemeral=True)
-        await send_log("config", build_log_embed("⚙️ Изменена настройка бота", [
-            f"**Кто изменил:** {interaction.user.mention}",
-            "**Что изменено:** Footer текст",
-            f"**Новое значение:** {self.footer_input.value}",
-        ]))
+        await interaction.response.send_message(embed=make_status_embed("Настройка изменена", f"Footer изменён на `{self.footer_input.value}`.", "success"), ephemeral=True)
 
-class LogChannelView(discord.ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=180)
-        self.owner_id = owner_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.", ephemeral=True)
-            return False
-        return True
-
+class LogChannelView(ConfigBaseView):
     @discord.ui.select(cls=discord.ui.ChannelSelect, placeholder="Выберите канал для логов...", channel_types=[discord.ChannelType.text])
     async def channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
         channel = select.values[0]
         update_config({"log_channel_id": channel.id})
-        embed = get_config_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-        await send_log("config", build_log_embed("⚙️ Изменена настройка бота", [
-            f"**Кто изменил:** {interaction.user.mention}",
-            "**Что изменено:** Канал логов",
-            f"**Новое значение:** {channel.mention}",
-        ]))
-
-    @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
-    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = get_config_embed()
-        view = ConfigMainView(self.owner_id)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(embed=get_config_section_embed("tickets"), view=TicketConfigView(self.owner_id))
 
 class LogTogglesSelect(discord.ui.Select):
     def __init__(self):
-        options = []
-        for cmd, default_value in LOGGABLE_COMMANDS_DEFAULT.items():
-            enabled = CONFIG.get("log_toggles", {}).get(cmd, default_value)
-            options.append(discord.SelectOption(label=cmd, value=cmd, default=enabled))
-        super().__init__(
-            placeholder="Отметьте команды, которые нужно логировать...",
-            min_values=0,
-            max_values=len(options),
-            options=options,
-        )
-
+        options = [discord.SelectOption(label=cmd, value=cmd, default=CONFIG.get("log_toggles", {}).get(cmd, default)) for cmd, default in LOGGABLE_COMMANDS_DEFAULT.items()]
+        super().__init__(placeholder="Выберите команды для логирования...", min_values=0, max_values=len(options), options=options)
     async def callback(self, interaction: discord.Interaction):
-        enabled_set = set(self.values)
-        new_toggles = {cmd: (cmd in enabled_set) for cmd in LOGGABLE_COMMANDS_DEFAULT}
-        update_config({"log_toggles": new_toggles})
-        embed = get_config_embed()
-        view = LogTogglesView(interaction.user.id)
-        await interaction.response.edit_message(embed=embed, view=view)
-        await send_log("config", build_log_embed("⚙️ Изменена настройка бота", [
-            f"**Кто изменил:** {interaction.user.mention}",
-            "**Что изменено:** Список логируемых команд",
-        ]))
+        enabled = set(self.values)
+        update_config({"log_toggles": {cmd: cmd in enabled for cmd in LOGGABLE_COMMANDS_DEFAULT}})
+        await interaction.response.edit_message(embed=get_config_section_embed("tickets"), view=TicketConfigView(self.view.owner_id))
 
-class LogTogglesView(discord.ui.View):
+class LogTogglesView(ConfigBaseView):
     def __init__(self, owner_id: int):
-        super().__init__(timeout=180)
-        self.owner_id = owner_id
+        super().__init__(owner_id)
         self.add_item(LogTogglesSelect())
+
+class TicketConfigView(ConfigBaseView):
+    @discord.ui.button(label="Канал логов", emoji="📨", style=discord.ButtonStyle.primary)
+    async def log_channel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_config_section_embed("tickets"), view=LogChannelView(self.owner_id))
+    @discord.ui.button(label="Команды для логов", emoji="🧾", style=discord.ButtonStyle.primary)
+    async def log_toggles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_config_section_embed("tickets"), view=LogTogglesView(self.owner_id))
+    @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_config_home_embed(), view=ConfigMainView(self.owner_id))
+
+class PermissionGroupSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=g.get("name", k), value=k, emoji=g.get("emoji", "🛡️")) for k, g in CONFIG.get("permission_groups", {}).items()]
+        super().__init__(placeholder="Выберите группу...", options=options)
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=get_config_section_embed("permissions"), view=PermissionEditorView(self.view.owner_id, self.values[0]))
+
+class PermissionConfigView(ConfigBaseView):
+    def __init__(self, owner_id: int):
+        super().__init__(owner_id)
+        self.add_item(PermissionGroupSelect())
+        back = discord.ui.Button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary)
+        back.callback = self.back_callback
+        self.add_item(back)
+    async def back_callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=get_config_home_embed(), view=ConfigMainView(self.owner_id))
+
+class PermissionRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, group_key: str):
+        self.group_key = group_key
+        super().__init__(placeholder="Выберите роли группы (заменяет список)...", min_values=0, max_values=25)
+    async def callback(self, interaction: discord.Interaction):
+        update_config({f"permission_groups.{self.group_key}.roles": [r.id for r in self.values]})
+        await interaction.response.edit_message(embed=get_config_section_embed("permissions"), view=PermissionEditorView(self.view.owner_id, self.group_key))
+
+class PermissionCommandSelect(discord.ui.Select):
+    def __init__(self, group_key: str):
+        self.group_key = group_key
+        current = set(get_group(group_key).get("commands", []))
+        options = [discord.SelectOption(label=label, value=cmd, default=cmd in current) for cmd, label in COMMAND_LABELS.items()]
+        super().__init__(placeholder="Выберите команды группы...", min_values=0, max_values=len(options), options=options)
+    async def callback(self, interaction: discord.Interaction):
+        update_config({f"permission_groups.{self.group_key}.commands": list(self.values)})
+        await interaction.response.edit_message(embed=get_config_section_embed("permissions"), view=PermissionEditorView(self.view.owner_id, self.group_key))
+
+class PermissionEditorView(ConfigBaseView):
+    def __init__(self, owner_id: int, group_key: str):
+        super().__init__(owner_id)
+        self.group_key = group_key
+        self.add_item(PermissionRoleSelect(group_key))
+        self.add_item(PermissionCommandSelect(group_key))
+        back = discord.ui.Button(label="Назад к группам", emoji="◀️", style=discord.ButtonStyle.secondary, row=2)
+        back.callback = self.back_callback
+        self.add_item(back)
+    async def back_callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=get_config_section_embed("permissions"), view=PermissionConfigView(self.owner_id))
+
+class LeaderboardConfigView(ConfigBaseView):
+    @discord.ui.select(placeholder="Выберите расположение...", options=[
+        discord.SelectOption(label="Горизонтально", value="horizontal", emoji="↔️"),
+        discord.SelectOption(label="Вертикально", value="vertical", emoji="↕️"),
+    ])
+    async def layout_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        update_config({"leaderboard_layout": select.values[0]})
+        await interaction.response.edit_message(embed=get_config_section_embed("leaderboard"), view=self)
+    @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_config_home_embed(), view=ConfigMainView(self.owner_id))
+
+class ResultChannelView(ConfigBaseView):
+    def __init__(self, owner_id: int, setting_key: str):
+        super().__init__(owner_id)
+        self.setting_key = setting_key
+    @discord.ui.select(cls=discord.ui.ChannelSelect, placeholder="Выберите текстовый канал...", channel_types=[discord.ChannelType.text])
+    async def channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
+        update_config({self.setting_key: select.values[0].id})
+        await interaction.response.edit_message(embed=get_config_section_embed("results"), view=ResultsConfigView(self.owner_id))
+
+class ResultsConfigView(ConfigBaseView):
+    @discord.ui.button(label="Канал считалки", emoji="💬", style=discord.ButtonStyle.primary)
+    async def count_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_config_section_embed("results"), view=ResultChannelView(self.owner_id, "counting_channel_id"))
+    @discord.ui.button(label="Канал bump", emoji="🚀", style=discord.ButtonStyle.primary)
+    async def bump_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_config_section_embed("results"), view=ResultChannelView(self.owner_id, "bump_channel_id"))
+    @discord.ui.button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=get_config_home_embed(), view=ConfigMainView(self.owner_id))
+
+class EmojiModal(discord.ui.Modal, title="Изменить эмодзи"):
+    emoji_input = discord.ui.TextInput(label="Эмодзи", placeholder="Вставьте эмодзи или текст", max_length=100)
+    def __init__(self, emoji_key: str):
+        super().__init__()
+        self.emoji_key = emoji_key
+        self.emoji_input.default = get_emoji(emoji_key)
+    async def on_submit(self, interaction: discord.Interaction):
+        emojis = dict(CONFIG.get("emojis", {}))
+        emojis[self.emoji_key] = self.emoji_input.value.strip()
+        update_config({"emojis": emojis})
+        await interaction.response.send_message(embed=make_status_embed("Настройка изменена", f"Эмодзи `{self.emoji_key}` обновлён.", "success"), ephemeral=True)
+
+class EmojiSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=k, value=k, description=f"Текущее: {get_emoji(k)[:90]}") for k in EMOJI_DEFAULTS]
+        super().__init__(placeholder="Выберите статусный эмодзи...", options=options)
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(EmojiModal(self.values[0]))
+
+class EmbedConfigView(ConfigBaseView):
+    def __init__(self, owner_id: int):
+        super().__init__(owner_id)
+        self.add_item(EmojiSelect())
         back = discord.ui.Button(label="Назад", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
         back.callback = self.back_callback
         self.add_item(back)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.", ephemeral=True)
-            return False
-        return True
-
     async def back_callback(self, interaction: discord.Interaction):
-        embed = get_config_embed()
-        view = ConfigMainView(self.owner_id)
-        await interaction.response.edit_message(embed=embed, view=view)
-
-class ConfigMainView(discord.ui.View):
-    def __init__(self, owner_id: int):
-        super().__init__(timeout=180)
-        self.owner_id = owner_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.select(
-        placeholder="Выберите, что настроить...",
-        options=[
-            discord.SelectOption(label="Цвет embed", value="color", emoji="🎨", description="Изменить цвет всех embed-сообщений бота"),
-            discord.SelectOption(label="Footer текст", value="footer", emoji="📝", description="Изменить текст в footer всех embed-сообщений"),
-            discord.SelectOption(label="Канал логов", value="log_channel", emoji="📨", description="Куда бот будет отправлять логи действий"),
-            discord.SelectOption(label="Команды для логов", value="log_toggles", emoji="🧾", description="Выбрать, какие команды логировать"),
-        ],
-    )
-    async def select_callback(self, interaction: discord.Interaction, select: discord.ui.Select):
-        value = select.values[0]
-        if value == "color":
-            await interaction.response.send_modal(ColorModal())
-        elif value == "footer":
-            await interaction.response.send_modal(FooterModal())
-        elif value == "log_channel":
-            embed = get_config_embed()
-            view = LogChannelView(self.owner_id)
-            await interaction.response.edit_message(embed=embed, view=view)
-        elif value == "log_toggles":
-            embed = get_config_embed()
-            view = LogTogglesView(self.owner_id)
-            await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(embed=get_config_home_embed(), view=ConfigMainView(self.owner_id))
 
 # ================= СЛЭШ КОМАНДЫ =================
 
 @bot.tree.command(name="help", description="Показать полный список команд бота")
-@check_support_slash()
+@check_support_slash("help")
 async def slash_help(interaction: discord.Interaction):
     embed = get_help_categories_embed(interaction.user, interaction.channel_id)
     view = HelpCategoriesView(interaction.user.id, interaction.channel_id)
-    await interaction.response.send_message(embed=embed, view=view)
+    await send_embed_with_header(interaction, embed, "help", view=view)
     await send_log("help", build_log_embed("📖 Использовано меню помощи", [f"**Кто:** {interaction.user.mention}"]))
 
 @bot.tree.command(name="addticket", description="Записать новый обработанный тикет")
 @app_commands.describe(staff="ID участника персонала", transcript="Ссылка на транскрипт", category="Категория тикета")
 @app_commands.choices(category=[app_commands.Choice(name=cat, value=cat) for cat in VALID_CATEGORIES])
-@check_transcript_slash()
+@check_transcript_slash("addticket")
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
 async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcript: str, category: str):
     if not is_valid_addticket(transcript, category):
@@ -909,25 +1165,25 @@ async def slash_add_ticket(interaction: discord.Interaction, staff: str, transcr
     try:
         staff_id = int(staff.strip("<@!>"))
     except ValueError:
-        await interaction.response.send_message(f"<:bruh:1521904409582375174> Некорректный ID: `{staff}`.", ephemeral=True)
+        await send_error_interaction(interaction, f"Некорректный ID: `{staff}`.")
         return
 
     if staff_id == interaction.user.id:
-        await interaction.response.send_message("<:bruh:1521904409582375174> Вы не можете занести тикет, который провели сами!", ephemeral=True)
+        await send_error_interaction(interaction, "Вы не можете занести тикет, который провели сами!")
         return
 
     if is_transcript_exists(transcript):
-        await interaction.response.send_message("<:bruh:1521904409582375174> Этот транскрипт уже внесен", ephemeral=True)
+        await send_error_interaction(interaction, "Этот транскрипт уже внесён.")
         return
 
     try:
         staff_user = await bot.fetch_user(staff_id)
     except (discord.NotFound, discord.HTTPException):
-        await interaction.response.send_message(f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff}`.", ephemeral=True)
+        await send_error_interaction(interaction, f"Не удалось найти пользователя по ID `{staff}`.")
         return
 
     embed, ticket_id = process_add_ticket(interaction.user, staff_user, transcript, category)
-    await interaction.response.send_message(embed=embed)
+    await send_embed_with_header(interaction, embed, "tickets")
     await send_log("addticket", build_log_embed("📥 Добавлен тикет", [
         f"**Номер лога:** №{ticket_id}",
         f"**Внёс:** {interaction.user.mention}",
@@ -941,14 +1197,12 @@ async def slash_add_ticket_error(interaction: discord.Interaction, error: app_co
     if isinstance(error, app_commands.CommandOnCooldown):
         if is_admin_user(interaction.user):
             return
-        await interaction.response.send_message(
-            f"<:zzz:1522341702852022412> Подождите ещё {error.retry_after:.1f} сек.", ephemeral=True
-        )
+        await send_error_interaction(interaction, f"Подождите ещё {error.retry_after:.1f} сек.", "Команда на кулдауне")
         return
 
 @bot.tree.command(name="deleteticket", description="Записать удаление тикета (канала) в базу данных")
 @app_commands.describe(log_id="Номер лога тикета (из .addticket)", transcript="Ссылка на транскрипт удаления")
-@check_transcript_slash()
+@check_transcript_slash("deleteticket")
 @app_commands.checks.cooldown(1, 3.0, key=lambda i: i.user.id)
 async def slash_delete_ticket_channel(interaction: discord.Interaction, log_id: int, transcript: str):
     if not is_valid_transcript_link(transcript):
@@ -957,13 +1211,13 @@ async def slash_delete_ticket_channel(interaction: discord.Interaction, log_id: 
 
     embed, error_code = process_delete_ticket_channel(interaction.user, log_id, transcript)
     if error_code == "not_found":
-        await interaction.response.send_message(f"<:bruh:1521904409582375174> Тикет с номером лога `{log_id}` не найден.", ephemeral=True)
+        await send_error_interaction(interaction, f"Тикет с номером лога `{log_id}` не найден.")
         return
     if error_code == "duplicate":
-        await interaction.response.send_message("<:bruh:1521904409582375174> Этот транскрипт удаления уже внесён.", ephemeral=True)
+        await send_error_interaction(interaction, "Этот транскрипт удаления уже внесён.")
         return
 
-    await interaction.response.send_message(embed=embed)
+    await send_embed_with_header(interaction, embed, "tickets")
     await send_log("deleteticket", build_log_embed("🗑️ Удалён тикет (канал)", [
         f"**Номер лога:** №{log_id}",
         f"**Внёс:** {interaction.user.mention}",
@@ -975,18 +1229,16 @@ async def slash_delete_ticket_channel_error(interaction: discord.Interaction, er
     if isinstance(error, app_commands.CommandOnCooldown):
         if is_admin_user(interaction.user):
             return
-        await interaction.response.send_message(
-            f"<:zzz:1522341702852022412> Подождите ещё {error.retry_after:.1f} сек.", ephemeral=True
-        )
+        await send_error_interaction(interaction, f"Подождите ещё {error.retry_after:.1f} сек.", "Команда на кулдауне")
         return
 
 @bot.tree.command(name="ticketstats", description="Посмотреть статистику тикетов")
 @app_commands.describe(staff="Участник персонала")
-@check_support_slash()
+@check_support_slash("ticketstats")
 async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.User = None):
     target = staff or interaction.user
     embed = process_ticket_stats(target)
-    await interaction.response.send_message(embed=embed)
+    await send_embed_with_header(interaction, embed, "tickets")
     await send_log("ticketstats", build_log_embed("📊 Просмотр статистики", [
         f"**Кто смотрел:** {interaction.user.mention}",
         f"**Чья статистика:** <@{target.id}>",
@@ -994,38 +1246,37 @@ async def slash_ticket_stats(interaction: discord.Interaction, staff: discord.Us
 
 @bot.tree.command(name="ticketlogs", description="Посмотреть тикеты пользователя")
 @app_commands.describe(staff="Участник персонала")
-@check_transcript_slash()
+@check_transcript_slash("ticketlogs")
 async def slash_ticket_logs(interaction: discord.Interaction, staff: discord.User = None):
     target = staff or interaction.user
     embed, total_pages = process_ticket_logs(target, 1)
 
     if total_pages > 1:
         view = TicketLogsPaginationView(interaction.user.id, target, total_pages, 1)
-        await interaction.response.send_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
+        view.message = await send_embed_with_header(interaction, embed, "tickets", view=view)
     else:
-        await interaction.response.send_message(embed=embed)
+        await send_embed_with_header(interaction, embed, "tickets")
     await send_log("ticketlogs", build_log_embed("📖 Просмотр логов тикетов", [
         f"**Кто смотрел:** {interaction.user.mention}",
         f"**Чьи логи:** <@{target.id}>",
     ]))
 
 @bot.tree.command(name="leaderboard", description="Посмотреть топ модераторов по тикетам и транскриптам")
-@check_support_slash()
+@check_support_slash("leaderboard")
 async def slash_leaderboard(interaction: discord.Interaction):
     embed = process_leaderboard()
-    await interaction.response.send_message(embed=embed)
+    await send_embed_with_header(interaction, embed, "leaderboard")
     await send_log("leaderboard", build_log_embed("🏆 Просмотр лидерборда", [f"**Кто:** {interaction.user.mention}"]))
 
 @bot.tree.command(name="deletelog", description="Удалить лог тикета по номеру (Только для Админов)")
 @app_commands.describe(log_id="Номер лога")
-@check_admin_slash()
+@check_admin_slash("deletelog")
 async def slash_delete_log(interaction: discord.Interaction, log_id: int):
     ticket = delete_ticket_log(log_id)
     if not ticket:
-        await interaction.response.send_message(f"<:bruh:1521904409582375174> Лог с номером `{log_id}` не найден.", ephemeral=True)
+        await send_error_interaction(interaction, f"Лог с номером `{log_id}` не найден.")
         return
-    await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
+    await interaction.response.send_message(embed=make_status_embed("Лог удалён", f"Лог `{log_id}` удалён.", "success"))
     await send_log("deletelog", build_log_embed("❌ Удалён лог тикета", [
         f"**Номер лога:** №{log_id}",
         f"**Кто удалил:** {interaction.user.mention}",
@@ -1033,10 +1284,10 @@ async def slash_delete_log(interaction: discord.Interaction, log_id: int):
 
 @bot.tree.command(name="resetlogs", description="Удалить все логи пользователя (Только для Админов)")
 @app_commands.describe(staff="Модератор")
-@check_admin_slash()
+@check_admin_slash("resetlogs")
 async def slash_reset_logs(interaction: discord.Interaction, staff: discord.User):
     count = reset_tickets(staff.id)
-    await interaction.response.send_message(f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`.")
+    await interaction.response.send_message(embed=make_status_embed("Логи сброшены", f"Удалено логов модератора **{staff.name}**: `{count}`.", "success"))
     await send_log("resetlogs", build_log_embed("♻️ Сброшены логи пользователя", [
         f"**Пользователь:** <@{staff.id}>",
         f"**Кто сбросил:** {interaction.user.mention}",
@@ -1046,25 +1297,34 @@ async def slash_reset_logs(interaction: discord.Interaction, staff: discord.User
 @bot.tree.command(name="config", description="Настройки бота (только для владельца)")
 async def slash_config(interaction: discord.Interaction):
     if not is_owner_user(interaction.user):
-        await interaction.response.send_message("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.", ephemeral=True)
+        await send_error_interaction(interaction, "Эта команда доступна только владельцу бота.", "Доступ запрещён")
         return
-    embed = get_config_embed()
+    embed = get_config_home_embed()
     view = ConfigMainView(interaction.user.id)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await send_embed_with_header(interaction, embed, "config", view=view, ephemeral=True)
     await send_log("config", build_log_embed("⚙️ Открыто меню настроек", [f"**Кто:** {interaction.user.mention}"]))
+
+# ================= ИТОГИ / СЧИТАЛКА =================
+
+@bot.tree.command(name="count", description="Показать итоги считалки и bump")
+@check_support_slash("count")
+async def slash_count(interaction: discord.Interaction):
+    embed = process_results()
+    await send_embed_with_header(interaction, embed, "results")
+    await send_log("count", build_log_embed("📊 Просмотр итогов", [f"**Кто:** {interaction.user.mention}"]))
 
 # ================= ПРЕФИКСНЫЕ КОМАНДЫ =================
 
 @bot.command(name="help")
-@check_support_prefix()
+@check_support_prefix("help")
 async def prefix_help(ctx: commands.Context):
     embed = get_help_categories_embed(ctx.author, ctx.channel.id)
     view = HelpCategoriesView(ctx.author.id, ctx.channel.id)
-    await ctx.send(embed=embed, view=view)
+    await send_embed_with_header(ctx, embed, "help", view=view)
     await send_log("help", build_log_embed("📖 Использовано меню помощи", [f"**Кто:** {ctx.author.mention}"]))
 
 @bot.command(name="addticket", aliases=["t", "ticket"])
-@check_transcript_prefix()
+@check_transcript_prefix("addticket")
 @commands.cooldown(1, 3.0, commands.BucketType.user)
 async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
     if not args:
@@ -1085,25 +1345,25 @@ async def prefix_add_ticket(ctx: commands.Context, *, args: str = None):
     try:
         staff_id = int(staff_raw.strip("<@!>"))
     except ValueError:
-        await ctx.send("<:bruh:1521904409582375174> Укажите корректный numeric ID модератора.")
+        await send_error_ctx(ctx, "Укажите корректный numeric ID модератора.")
         return
 
     if staff_id == ctx.author.id:
-        await ctx.send("<:bruh:1521904409582375174> Вы не можете занести тикет, который провели сами!")
+        await send_error_ctx(ctx, "Вы не можете занести тикет, который провели сами!")
         return
 
     if is_transcript_exists(transcript):
-        await ctx.send("<:bruh:1521904409582375174> Этот транскрипт уже внесен")
+        await send_error_ctx(ctx, "Этот транскрипт уже внесён.")
         return
 
     try:
         staff_user = await bot.fetch_user(staff_id)
     except (discord.NotFound, discord.HTTPException):
-        await ctx.send(f"<:bruh:1521904409582375174> Не удалось найти пользователя по ID `{staff_raw}`.")
+        await send_error_ctx(ctx, f"Не удалось найти пользователя по ID `{staff_raw}`.")
         return
 
     embed, ticket_id = process_add_ticket(ctx.author, staff_user, transcript, category)
-    await ctx.send(embed=embed)
+    await send_embed_with_header(ctx, embed, "tickets")
     await send_log("addticket", build_log_embed("📥 Добавлен тикет", [
         f"**Номер лога:** №{ticket_id}",
         f"**Внёс:** {ctx.author.mention}",
@@ -1119,15 +1379,15 @@ async def prefix_add_ticket_error(ctx: commands.Context, error):
             ctx.command.reset_cooldown(ctx)
             await ctx.reinvoke()
             return
-        await ctx.send(f"<:zzz:1522341702852022412> Подождите ещё {error.retry_after:.1f} сек.")
+        await send_error_ctx(ctx, f"Подождите ещё {error.retry_after:.1f} сек.", "Команда на кулдауне")
         return
     if isinstance(error, commands.CheckFailure):
-        await ctx.send(f"<:bruh:1521904409582375174> {error}")
+        await send_error_ctx(ctx, str(error) or "Недостаточно прав.", "Недостаточно прав")
         return
     await ctx.send(embed=get_addticket_usage_embed())
 
 @bot.command(name="deleteticket", aliases=["dt"])
-@check_transcript_prefix()
+@check_transcript_prefix("deleteticket")
 @commands.cooldown(1, 3.0, commands.BucketType.user)
 async def prefix_delete_ticket_channel(ctx: commands.Context, *, args: str = None):
     if not args:
@@ -1144,7 +1404,7 @@ async def prefix_delete_ticket_channel(ctx: commands.Context, *, args: str = Non
     try:
         log_id = int(log_id_raw)
     except ValueError:
-        await ctx.send(f"<:bruh:1521904409582375174> Номер лога должен быть числом: `{log_id_raw}`.")
+        await send_error_ctx(ctx, f"Номер лога должен быть числом: `{log_id_raw}`.")
         return
 
     if not is_valid_transcript_link(transcript):
@@ -1153,13 +1413,13 @@ async def prefix_delete_ticket_channel(ctx: commands.Context, *, args: str = Non
 
     embed, error_code = process_delete_ticket_channel(ctx.author, log_id, transcript)
     if error_code == "not_found":
-        await ctx.send(f"<:bruh:1521904409582375174> Тикет с номером лога `{log_id}` не найден.")
+        await send_error_ctx(ctx, f"Тикет с номером лога `{log_id}` не найден.")
         return
     if error_code == "duplicate":
-        await ctx.send("<:bruh:1521904409582375174> Этот транскрипт удаления уже внесён.")
+        await send_error_ctx(ctx, "Этот транскрипт удаления уже внесён.")
         return
 
-    await ctx.send(embed=embed)
+    await send_embed_with_header(ctx, embed, "tickets")
     await send_log("deleteticket", build_log_embed("🗑️ Удалён тикет (канал)", [
         f"**Номер лога:** №{log_id}",
         f"**Внёс:** {ctx.author.mention}",
@@ -1173,19 +1433,19 @@ async def prefix_delete_ticket_channel_error(ctx: commands.Context, error):
             ctx.command.reset_cooldown(ctx)
             await ctx.reinvoke()
             return
-        await ctx.send(f"<:zzz:1522341702852022412> Подождите ещё {error.retry_after:.1f} сек.")
+        await send_error_ctx(ctx, f"Подождите ещё {error.retry_after:.1f} сек.", "Команда на кулдауне")
         return
     if isinstance(error, commands.CheckFailure):
-        await ctx.send(f"<:bruh:1521904409582375174> {error}")
+        await send_error_ctx(ctx, str(error) or "Недостаточно прав.", "Недостаточно прав")
         return
     await ctx.send(embed=get_deleteticket_usage_embed())
 
 @bot.command(name="ticketstats", aliases=["ts"])
-@check_support_prefix()
+@check_support_prefix("ticketstats")
 async def prefix_ticket_stats(ctx: commands.Context, staff: discord.User = None):
     target = staff or ctx.author
     embed = process_ticket_stats(target)
-    await ctx.send(embed=embed)
+    await send_embed_with_header(ctx, embed, "tickets")
     await send_log("ticketstats", build_log_embed("📊 Просмотр статистики", [
         f"**Кто смотрел:** {ctx.author.mention}",
         f"**Чья статистика:** <@{target.id}>",
@@ -1197,14 +1457,14 @@ async def prefix_ticket_stats_error(ctx: commands.Context, error):
         await ctx.send(embed=get_ticketstats_usage_embed())
 
 @bot.command(name="ticketlogs", aliases=["tl", "tlogs"])
-@check_transcript_prefix()
+@check_transcript_prefix("ticketlogs")
 async def prefix_ticket_logs(ctx: commands.Context, staff: discord.User = None):
     target = staff or ctx.author
     embed, total_pages = process_ticket_logs(target, 1)
 
     if total_pages > 1:
         view = TicketLogsPaginationView(ctx.author.id, target, total_pages, 1)
-        msg = await ctx.send(embed=embed, view=view)
+        msg = await send_embed_with_header(ctx, embed, "tickets", view=view)
         view.message = msg
     else:
         await ctx.send(embed=embed)
@@ -1219,23 +1479,23 @@ async def prefix_ticket_logs_error(ctx: commands.Context, error):
         await ctx.send(embed=get_ticketlogs_usage_embed())
 
 @bot.command(name="leaderboard", aliases=["lb", "top", "leaderstats"])
-@check_support_prefix()
+@check_support_prefix("leaderboard")
 async def prefix_leaderboard(ctx: commands.Context):
     embed = process_leaderboard()
-    await ctx.send(embed=embed)
+    await send_embed_with_header(ctx, embed, "leaderboard")
     await send_log("leaderboard", build_log_embed("🏆 Просмотр лидерборда", [f"**Кто:** {ctx.author.mention}"]))
 
 @bot.command(name="deletelog", aliases=["del"])
-@check_admin_prefix()
+@check_admin_prefix("deletelog")
 async def prefix_delete_log(ctx: commands.Context, log_id: int = None):
     if log_id is None:
         await ctx.send(embed=get_deletelog_usage_embed())
         return
     ticket = delete_ticket_log(log_id)
     if not ticket:
-        await ctx.send(f"<:bruh:1521904409582375174> Лог под номером `{log_id}` не найден.")
+        await send_error_ctx(ctx, f"Лог под номером `{log_id}` не найден.")
         return
-    await ctx.send(f"<a:gif_verify:1522328481956888686> Лог `{log_id}` удалён.")
+    await ctx.send(embed=make_status_embed("Лог удалён", f"Лог `{log_id}` удалён.", "success"))
     await send_log("deletelog", build_log_embed("❌ Удалён лог тикета", [
         f"**Номер лога:** №{log_id}",
         f"**Кто удалил:** {ctx.author.mention}",
@@ -1247,13 +1507,13 @@ async def prefix_delete_log_error(ctx: commands.Context, error):
         await ctx.send(embed=get_deletelog_usage_embed())
 
 @bot.command(name="resetlogs", aliases=["rt"])
-@check_admin_prefix()
+@check_admin_prefix("resetlogs")
 async def prefix_reset_logs(ctx: commands.Context, staff: discord.User = None):
     if staff is None:
         await ctx.send(embed=get_resetlogs_usage_embed())
         return
     count = reset_tickets(staff.id)
-    await ctx.send(f"<a:gif_verify:1522328481956888686> Удалено логов модератора **{staff.name}**: `{count}`.")
+    await ctx.send(embed=make_status_embed("Логи сброшены", f"Удалено логов модератора **{staff.name}**: `{count}`.", "success"))
     await send_log("resetlogs", build_log_embed("♻️ Сброшены логи пользователя", [
         f"**Пользователь:** <@{staff.id}>",
         f"**Кто сбросил:** {ctx.author.mention}",
@@ -1265,14 +1525,22 @@ async def prefix_reset_logs_error(ctx: commands.Context, error):
     if isinstance(error, commands.BadArgument):
         await ctx.send(embed=get_resetlogs_usage_embed())
 
+@bot.command(name="подсчет", aliases=["count", "stats"])
+@check_support_prefix("count")
+async def prefix_count(ctx: commands.Context):
+    embed = process_results()
+    await send_embed_with_header(ctx, embed, "results")
+    await send_log("count", build_log_embed("📊 Просмотр итогов", [f"**Кто:** {ctx.author.mention}"]))
+
+
 @bot.command(name="config")
 async def prefix_config(ctx: commands.Context):
     if not is_owner_user(ctx.author):
-        await ctx.send("<:bruh:1521904409582375174> Эта команда доступна только владельцу бота.")
+        await send_error_ctx(ctx, "Эта команда доступна только владельцу бота.", "Доступ запрещён")
         return
-    embed = get_config_embed()
+    embed = get_config_home_embed()
     view = ConfigMainView(ctx.author.id)
-    await ctx.send(embed=embed, view=view)
+    await send_embed_with_header(ctx, embed, "config", view=view)
     await send_log("config", build_log_embed("⚙️ Открыто меню настроек", [f"**Кто:** {ctx.author.mention}"]))
 
 # ================= ЗАПУСК БОТА =================
